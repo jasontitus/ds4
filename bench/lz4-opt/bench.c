@@ -438,7 +438,7 @@ int main(int argc, char **argv) {
         }
         if (td < 0) return 1;
     }
-    if (cf.size > 0 && memcmp(cf.data, dbuf, cf.size) != 0) {
+    if (warmup > 0 && cf.size > 0 && memcmp(cf.data, dbuf, cf.size) != 0) {
         fprintf(stderr, "ROUND-TRIP MISMATCH in warmup\n");
         return 1;
     }
