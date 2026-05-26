@@ -83,6 +83,63 @@ review focus.  Validated correctness: `./ds4_test` passes the
 `logprob-vectors` failure as on `kv-cache-lz4` HEAD without the
 patch).
 
+## Why the wins look modest today, and what changes at GB scale
+
+The cache files we have on hand top out at 640 MiB raw / 354 MiB on
+disk.  Long-context production usage (ctx=400 K+ tokens) routinely
+produces 2–8 GiB of raw KV state.  Two effects compound to make the
+codec progressively more valuable as files grow:
+
+1. **Fixed overheads** (pthread_create, mutex/condvar init,
+   framing-header read) are roughly constant per load.  At ~5 ms
+   total, that's ~50 % of an 11 ms small-file load but <1 % of a
+   1 s multi-GB load.
+2. **Pipelining only does real work when chunk_count > thread_count.**
+   At default 16 MiB chunks and 8 threads, you need >128 MiB raw
+   before all workers stay busy; below that, half the threads sit
+   idle and the per-load wall is bounded by the LAST chunk's
+   read+decompress.
+
+### Asymptotic limits (the math)
+
+Let `N` = uncompressed bytes, `R` = compression ratio (1.81 on real
+KV), `D` = disk read throughput (~6.3 GB/s on M1 Ultra NVMe), and
+`K` = aggregate parallel decompress throughput (~22.7 GB/s with 8
+threads).  Ignoring fixed overhead:
+
+- *Uncompressed read*: `N / D`
+- *Batched LZ4* (serial read+decompress phases per batch):
+  `N / (R·D) + N / K`
+- *Threaded LZ4* (pipelined): `max(N / (R·D), N / K)`
+
+Speedup vs uncompressed:
+
+- batched ≈ `1 / (1/R + D/K)` = `1 / (0.55 + 0.28)` ≈ **1.20×**
+- threaded ≈ `1 / max(1/R, D/K)` = `1 / 0.55` = **1.81×** — i.e.
+  the disk read of the compressed file dominates and decompress is
+  fully hidden under it.
+
+So the *threaded* design asymptotes to the compression ratio itself
+on large files, while the *batched* design caps at ~1.2× because the
+phases serialize.
+
+### Extrapolation table
+
+Measured at 640 MiB; everything else from the analytic model + 15 ms
+fixed overhead (should hold within ~10 %):
+
+| raw size | baseline | batched (current PR) | threaded (refactor) |
+|---:|---:|---:|---:|
+|  640 MiB |   98 ms |   94 ms (+4 %, measured) |   71 ms (+39 %, measured) |
+|    2 GiB | ~325 ms | ~270 ms (+20 %)           | ~195 ms (**+67 %**) |
+|    8 GiB | ~1.3 s  | ~1.06 s (+22 %)           | ~0.74 s (**+77 %**) |
+
+In other words: the small/medium load deltas reported above are the
+*worst case* for the codec.  Any cache file in the GB-and-up range —
+which is the actual regime for long-context conversations — gets
+close to the full compression-ratio speedup with the threaded
+refactor.
+
 ## Optimization 3 — adaptive no-compress for tiny caches
 
 Not implemented; ~10 lines.
