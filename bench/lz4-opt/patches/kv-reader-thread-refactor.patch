@@ -1,0 +1,319 @@
+diff --git a/ds4_kvstore.c b/ds4_kvstore.c
+index 6e09008..a2e13f3 100644
+--- a/ds4_kvstore.c
++++ b/ds4_kvstore.c
+@@ -280,16 +280,6 @@ static void *kv_lz4_compress_worker(void *arg) {
+     return NULL;
+ }
+ 
+-static void *kv_lz4_decompress_worker(void *arg) {
+-    kv_lz4_job *j = arg;
+-    j->out_size = LZ4_decompress_safe((const char *)j->src,
+-                                      (char *)j->dst,
+-                                      j->src_size,
+-                                      j->dst_capacity);
+-    j->ok = j->out_size == j->dst_capacity;
+-    return NULL;
+-}
+-
+ /* Run up to n_workers jobs in parallel and join them.  n_workers == 1 runs
+  * inline on the calling thread; the pthread fork is just dead overhead for
+  * a single job. */
+@@ -504,11 +494,25 @@ fail:
+     return NULL;
+ }
+ 
+-/* Reader cookie state.  We read one chunk at a time, decompress it, and
+- * hand bytes out through kv_lz4_reader_read until the slot is drained.
+- * The first call lazily reads the 12-byte framing header so kv_lz4_reader_open
+- * can be called before payload bytes are known. */
++/* Reader cookie state.  A dedicated reader thread reads chunks from disk
++ * and dispatches per-chunk decompress workers into a ring of `batch_cap`
++ * slots.  The consumer (cookie read callback) drains slots in chunk order
++ * via a mutex + condvar handshake.  This overlaps disk reads with
++ * decompress AND with engine-side KV restore: the reader runs ahead of
++ * the consumer until all slots are full, then blocks. */
++enum kv_lz4_slot_state {
++    KV_LZ4_SLOT_FREE = 0,    /* reader may claim and refill */
++    KV_LZ4_SLOT_BUSY = 1,    /* reader/worker owns it (comp read or decompress in flight) */
++    KV_LZ4_SLOT_READY = 2    /* raw bytes ready for consumer */
++};
++
++typedef struct kv_lz4_reader kv_lz4_reader;
+ typedef struct {
++    kv_lz4_reader *r;
++    int slot;
++} kv_lz4_async_arg;
++
++struct kv_lz4_reader {
+     FILE *in;
+     uint32_t chunk_size;
+     int n_workers;
+@@ -516,20 +520,32 @@ typedef struct {
+     uint8_t **raw;          /* per-slot decompressed scratch */
+     uint8_t **comp;         /* per-slot compressed input scratch */
+     int comp_capacity;
+-    uint32_t *raw_sizes;    /* per-slot uncompressed size for the current batch */
+-    uint32_t *comp_sizes;   /* per-slot compressed size for the current batch */
++    uint32_t *raw_sizes;    /* per-slot uncompressed size */
++    uint32_t *comp_sizes;   /* per-slot compressed size */
+ 
+     uint64_t payload_bytes; /* on-disk payload budget remaining (compressed) */
+     uint64_t uncompressed_total;
+     uint32_t chunk_count;
+     uint32_t chunks_consumed;
+     bool framing_read;
+-
+-    int batch_n;            /* slots filled by the most recent read-batch */
+-    int batch_pos;          /* next slot to hand out from the current batch */
+-    uint32_t pos_in_slot;   /* offset within raw[batch_pos] */
+     bool err;
+-} kv_lz4_reader;
++
++    /* Reader-thread machinery.  `state[i]` is the slot state, guarded by
++     * `mu`.  Workers are pthread_create()d per-chunk; the reader joins
++     * the old worker before reusing a slot, so `worker_tids[i]` is valid
++     * iff `worker_valid[i]`. */
++    pthread_t reader_tid;
++    pthread_t worker_tids[64];
++    kv_lz4_async_arg worker_args[64];
++    int state[64];
++    bool worker_valid[64];
++    pthread_mutex_t mu;
++    pthread_cond_t cv_slot_free;   /* signaled when a slot becomes FREE */
++    pthread_cond_t cv_slot_ready;  /* signaled when a slot becomes READY */
++    bool shutdown;                 /* set by close() to wake reader early */
++    bool reader_started;
++    uint32_t pos_in_slot;          /* consumer's byte offset within current slot */
++};
+ 
+ /* Read the 12-byte framing header (uncompressed_total, chunk_count) at the
+  * start of the payload region.  Called lazily on the first read.
+@@ -550,88 +566,146 @@ static bool kv_lz4_reader_read_framing(kv_lz4_reader *r) {
+     return true;
+ }
+ 
+-/* Read the next batch of up to batch_cap chunks, decompress them in parallel,
+- * leave them in raw[0..batch_n) for kv_lz4_reader_read to hand out in order. */
+-static void kv_lz4_reader_fill_batch(kv_lz4_reader *r) {
+-    r->batch_n = 0;
+-    r->batch_pos = 0;
+-    r->pos_in_slot = 0;
+-    int n = 0;
+-    while (n < r->batch_cap && r->chunks_consumed + (uint32_t)n < r->chunk_count) {
++/* Per-chunk decompress worker.  Called via pthread_create from the reader
++ * thread; flips its slot state to READY and signals the consumer. */
++static void *kv_lz4_async_decompress_worker(void *arg) {
++    kv_lz4_async_arg *a = arg;
++    kv_lz4_reader *r = a->r;
++    int slot = a->slot;
++    int n = LZ4_decompress_safe((const char *)r->comp[slot], (char *)r->raw[slot],
++                                (int)r->comp_sizes[slot], (int)r->raw_sizes[slot]);
++    pthread_mutex_lock(&r->mu);
++    if (n != (int)r->raw_sizes[slot]) r->err = true;
++    r->state[slot] = KV_LZ4_SLOT_READY;
++    pthread_cond_broadcast(&r->cv_slot_ready);
++    pthread_mutex_unlock(&r->mu);
++    return NULL;
++}
++
++/* Reader thread: streams chunks off disk into ring slots, dispatching a
++ * decompress worker per chunk.  Joins the previous worker on a slot before
++ * reusing it. */
++static void *kv_lz4_reader_thread(void *arg) {
++    kv_lz4_reader *r = arg;
++    uint32_t dispatched = 0;
++    while (dispatched < r->chunk_count) {
++        int slot = (int)(dispatched % (uint32_t)r->batch_cap);
++
++        pthread_mutex_lock(&r->mu);
++        while (r->state[slot] != KV_LZ4_SLOT_FREE && !r->shutdown && !r->err) {
++            pthread_cond_wait(&r->cv_slot_free, &r->mu);
++        }
++        if (r->shutdown || r->err) { pthread_mutex_unlock(&r->mu); break; }
++        bool need_join = r->worker_valid[slot];
++        pthread_t old_tid = need_join ? r->worker_tids[slot] : (pthread_t){0};
++        r->worker_valid[slot] = false;
++        r->state[slot] = KV_LZ4_SLOT_BUSY;
++        pthread_mutex_unlock(&r->mu);
++
++        if (need_join) pthread_join(old_tid, NULL);
++
+         uint8_t lens[8];
+         if (r->payload_bytes < sizeof(lens) ||
+             fread(lens, 1, sizeof(lens), r->in) != sizeof(lens))
+         {
+-            r->err = true;
+-            return;
++            goto fail;
+         }
+-        uint32_t raw = ds4_kvstore_le_get32(lens);
+-        uint32_t comp = ds4_kvstore_le_get32(lens + 4);
+-        if (raw == 0 || raw > r->chunk_size || comp == 0 ||
+-            comp > (uint32_t)r->comp_capacity ||
+-            r->payload_bytes < sizeof(lens) + (uint64_t)comp ||
+-            fread(r->comp[n], 1, comp, r->in) != comp)
++        uint32_t raw_size = ds4_kvstore_le_get32(lens);
++        uint32_t comp_size = ds4_kvstore_le_get32(lens + 4);
++        if (raw_size == 0 || raw_size > r->chunk_size || comp_size == 0 ||
++            comp_size > (uint32_t)r->comp_capacity ||
++            r->payload_bytes < sizeof(lens) + (uint64_t)comp_size ||
++            fread(r->comp[slot], 1, comp_size, r->in) != comp_size)
+         {
+-            r->err = true;
+-            return;
++            goto fail;
+         }
+-        r->payload_bytes -= sizeof(lens) + (uint64_t)comp;
+-        r->raw_sizes[n] = raw;
+-        r->comp_sizes[n] = comp;
+-        n++;
++        r->payload_bytes -= sizeof(lens) + (uint64_t)comp_size;
++        r->raw_sizes[slot] = raw_size;
++        r->comp_sizes[slot] = comp_size;
++        r->worker_args[slot] = (kv_lz4_async_arg){ .r = r, .slot = slot };
++
++        if (r->n_workers > 1 &&
++            pthread_create(&r->worker_tids[slot], NULL,
++                           kv_lz4_async_decompress_worker, &r->worker_args[slot]) == 0)
++        {
++            pthread_mutex_lock(&r->mu);
++            r->worker_valid[slot] = true;
++            pthread_mutex_unlock(&r->mu);
++        } else {
++            /* Inline fallback: do the decompress on the reader thread.
++             * Same effect as the worker, minus the fork. */
++            kv_lz4_async_decompress_worker(&r->worker_args[slot]);
++        }
++        dispatched++;
+     }
+     /* After the final chunk we must have consumed exactly the declared
+      * compressed payload region.  Any leftover bytes mean the file's
+      * payload_bytes header was lying about its size, or chunk records do
+      * not pack tightly as the writer claims. */
+-    if (r->chunks_consumed + (uint32_t)n == r->chunk_count && r->payload_bytes != 0) {
+-        r->err = true;
+-        return;
+-    }
+-    if (n == 0) return;
+-    kv_lz4_job jobs[64];
+-    for (int i = 0; i < n; i++) {
+-        jobs[i] = (kv_lz4_job){
+-            .src = r->comp[i],
+-            .dst = r->raw[i],
+-            .src_size = (int)r->comp_sizes[i],
+-            .dst_capacity = (int)r->raw_sizes[i],
+-            .out_size = 0,
+-            .ok = false,
+-        };
++    if (!r->shutdown && !r->err && dispatched == r->chunk_count && r->payload_bytes != 0) {
++        goto fail;
+     }
+-    kv_lz4_run_batch(jobs, n, r->n_workers, kv_lz4_decompress_worker);
+-    for (int i = 0; i < n; i++) {
+-        if (!jobs[i].ok) { r->err = true; return; }
++    goto done;
++fail:
++    pthread_mutex_lock(&r->mu);
++    r->err = true;
++    pthread_cond_broadcast(&r->cv_slot_ready);
++    pthread_cond_broadcast(&r->cv_slot_free);
++    pthread_mutex_unlock(&r->mu);
++done:
++    /* Join any outstanding workers we left behind. */
++    for (int i = 0; i < r->batch_cap; i++) {
++        pthread_mutex_lock(&r->mu);
++        bool v = r->worker_valid[i];
++        pthread_t tid = v ? r->worker_tids[i] : (pthread_t){0};
++        r->worker_valid[i] = false;
++        pthread_mutex_unlock(&r->mu);
++        if (v) pthread_join(tid, NULL);
+     }
+-    r->batch_n = n;
++    return NULL;
+ }
+ 
+-/* Cookie read callback.  Hand out bytes from the current decompressed batch;
+- * pull a new batch when the current one is drained. */
++/* Cookie read callback.  Wait for the next-in-order slot to be READY,
++ * copy bytes out, mark the slot FREE when fully drained. */
+ static kv_lz4_io_ssize_t kv_lz4_reader_read(void *cookie, char *buf, kv_lz4_io_size_t n_in) {
+     kv_lz4_reader *r = cookie;
+     if (r->err) return -1;
+-    if (!r->framing_read && !kv_lz4_reader_read_framing(r)) return -1;
++    if (!r->framing_read) {
++        if (!kv_lz4_reader_read_framing(r)) return -1;
++    }
++    if (!r->reader_started) {
++        /* Spawn the reader thread on first read.  framing_read is now
++         * true so the reader thread can start dispatching from chunk 0. */
++        if (pthread_create(&r->reader_tid, NULL, kv_lz4_reader_thread, r) != 0) {
++            r->err = true;
++            return -1;
++        }
++        r->reader_started = true;
++    }
+     const size_t n = (size_t)n_in;
+     size_t produced = 0;
+-    while (produced < n) {
+-        if (r->chunks_consumed >= r->chunk_count && r->batch_pos >= r->batch_n) break;
+-        if (r->batch_pos >= r->batch_n) {
+-            kv_lz4_reader_fill_batch(r);
+-            if (r->err) return -1;
+-            if (r->batch_n == 0) break;
++    while (produced < n && r->chunks_consumed < r->chunk_count) {
++        int slot = (int)(r->chunks_consumed % (uint32_t)r->batch_cap);
++        pthread_mutex_lock(&r->mu);
++        while (r->state[slot] != KV_LZ4_SLOT_READY && !r->err) {
++            pthread_cond_wait(&r->cv_slot_ready, &r->mu);
+         }
+-        uint32_t slot_size = r->raw_sizes[r->batch_pos];
++        if (r->err) { pthread_mutex_unlock(&r->mu); return -1; }
++        pthread_mutex_unlock(&r->mu);
++
++        uint32_t slot_size = r->raw_sizes[slot];
+         uint32_t avail = slot_size - r->pos_in_slot;
+         size_t take = n - produced < avail ? n - produced : avail;
+-        memcpy(buf + produced, r->raw[r->batch_pos] + r->pos_in_slot, take);
++        memcpy(buf + produced, r->raw[slot] + r->pos_in_slot, take);
+         produced += take;
+         r->pos_in_slot += (uint32_t)take;
+         if (r->pos_in_slot == slot_size) {
+             r->pos_in_slot = 0;
+-            r->batch_pos++;
+             r->chunks_consumed++;
++            pthread_mutex_lock(&r->mu);
++            r->state[slot] = KV_LZ4_SLOT_FREE;
++            pthread_cond_signal(&r->cv_slot_free);
++            pthread_mutex_unlock(&r->mu);
+         }
+     }
+     return (kv_lz4_io_ssize_t)produced;
+@@ -639,6 +713,17 @@ static kv_lz4_io_ssize_t kv_lz4_reader_read(void *cookie, char *buf, kv_lz4_io_s
+ 
+ static int kv_lz4_reader_close(void *cookie) {
+     kv_lz4_reader *r = cookie;
++    if (r->reader_started) {
++        pthread_mutex_lock(&r->mu);
++        r->shutdown = true;
++        pthread_cond_broadcast(&r->cv_slot_free);
++        pthread_cond_broadcast(&r->cv_slot_ready);
++        pthread_mutex_unlock(&r->mu);
++        pthread_join(r->reader_tid, NULL);
++    }
++    pthread_mutex_destroy(&r->mu);
++    pthread_cond_destroy(&r->cv_slot_free);
++    pthread_cond_destroy(&r->cv_slot_ready);
+     for (int i = 0; i < r->batch_cap; i++) { free(r->raw[i]); free(r->comp[i]); }
+     free(r->raw);
+     free(r->comp);
+@@ -671,6 +756,9 @@ FILE *kv_lz4_reader_open(FILE *in, uint64_t payload_bytes,
+     r->batch_cap = n_workers;
+     r->comp_capacity = comp_bound;
+     r->payload_bytes = payload_bytes;
++    pthread_mutex_init(&r->mu, NULL);
++    pthread_cond_init(&r->cv_slot_free, NULL);
++    pthread_cond_init(&r->cv_slot_ready, NULL);
+     r->raw = calloc((size_t)n_workers, sizeof(uint8_t *));
+     r->comp = calloc((size_t)n_workers, sizeof(uint8_t *));
+     r->raw_sizes = calloc((size_t)n_workers, sizeof(uint32_t));

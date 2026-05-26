@@ -1,0 +1,129 @@
+From 95ce3d297deb9f721fd304ecabd1cd71649b070d Mon Sep 17 00:00:00 2001
+From: Jason Titus <jason.titus@gmail.com>
+Date: Tue, 26 May 2026 15:00:27 -0700
+Subject: [PATCH 1/3] lz4: 9.5% compress throughput on real KV data
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Two local edits to the vendored lz4 v1.10.0 fast-mode compress path:
+
+* LZ4_skipTrigger 6 -> 4. The probe step stride ramps up 4x faster
+  on incompressible regions inside a chunk. Real KV state alternates
+  compressible (quantized weight blocks) and incompressible
+  (activation residuals) runs within the 16 MiB chunk; the faster
+  ramp also leaves the hash table less polluted with stale entries,
+  so the next compressible run finds more matches.
+
+* Branchless safe-address inside the match-candidate check (zstd
+  PR #4165 idiom). Redirect the load through ip when the distance
+  check or dictSmall bound would have continued, then issue one
+  combined branch from an OR of the predicates. Apple Silicon's
+  ~600-entry reorder buffer swallows the now data-dependent load.
+
+On real .kv files (raw bytes the codec actually sees, threads=8,
+chunk=16 MiB):
+
+  baseline           3441 MB/s compress, 22697 MB/s decompress, 1.808x
+  ds4 lz4            3768 MB/s compress, 22661 MB/s decompress, 1.816x
+                     +9.5% compress, +0.46% ratio, decompress unchanged.
+
+Decompress is dominated by disk read + engine restore on real
+loads, so the unchanged figure is fine for user-visible latency.
+Save-side throughput translates to about a 5% TTLB win post-prefill
+on the 47K-token A/B in the PR table.
+
+Round-trip preserved on all 6 real .kv files at both 16 MiB and 64K
+block sizes, plus lz4's own 1080-case verify suite. The bench
+framework that produced these numbers lives on the
+claude/lz4-zstd-optimization-review-bhzHf branch.
+
+See misc/COMPRESSED_KV_CACHE.md "Vendored lz4 — local
+modifications" for the diff rationale and a re-vendor checklist.
+---
+ lz4.c                       | 23 +++++++++++++----------
+ misc/COMPRESSED_KV_CACHE.md | 27 +++++++++++++++++++++++++++
+ 2 files changed, 40 insertions(+), 10 deletions(-)
+
+diff --git a/lz4.c b/lz4.c
+index a2f7abe..0b50b04 100644
+--- a/lz4.c
++++ b/lz4.c
+@@ -708,7 +708,7 @@ unsigned LZ4_count(const BYTE* pIn, const BYTE* pMatch, const BYTE* pInLimit)
+ *  Local Constants
+ **************************************/
+ static const int LZ4_64Klimit = ((64 KB) + (MFLIMIT-1));
+-static const U32 LZ4_skipTrigger = 6;  /* Increase this value ==> compression run slower on incompressible data */
++static const U32 LZ4_skipTrigger = 4;  /* ds4: 6 -> 4, faster skip on incompressible KV bytes */
+ 
+ 
+ /*-************************************
+@@ -1085,15 +1085,18 @@ LZ4_FORCE_INLINE int LZ4_compress_generic_validated(
+                 LZ4_putIndexOnHash(current, h, cctx->hashTable, tableType);
+ 
+                 DEBUGLOG(7, "candidate at pos=%u  (offset=%u \n", matchIndex, current - matchIndex);
+-                if ((dictIssue == dictSmall) && (matchIndex < prefixIdxLimit)) { continue; }    /* match outside of valid area */
+-                assert(matchIndex < current);
+-                if ( ((tableType != byU16) || (LZ4_DISTANCE_MAX < LZ4_DISTANCE_ABSOLUTE_MAX))
+-                  && (matchIndex+LZ4_DISTANCE_MAX < current)) {
+-                    continue;
+-                } /* too far */
+-                assert((current - matchIndex) <= LZ4_DISTANCE_MAX);  /* match now expected within distance */
+-
+-                if (LZ4_read32(match) == LZ4_read32(ip)) {
++                /* ds4: branchless safe-address (zstd PR #4165). On
++                 * incompressible KV bytes the OoO window swallows the
++                 * unconditional load + OR-combined predicate. */
++                {
++                    int const too_far = ((tableType != byU16) || (LZ4_DISTANCE_MAX < LZ4_DISTANCE_ABSOLUTE_MAX))
++                                        && (matchIndex + LZ4_DISTANCE_MAX < current);
++                    int const dictSmallOOR = (dictIssue == dictSmall) && (matchIndex < prefixIdxLimit);
++                    const BYTE *safe_match = (too_far | dictSmallOOR) ? ip : match;
++                    U32 const m32 = LZ4_read32(safe_match);
++                    U32 const ip32 = LZ4_read32(ip);
++                    if ((m32 != ip32) | too_far | dictSmallOOR) continue;
++                    assert((current - matchIndex) <= LZ4_DISTANCE_MAX);
+                     if (maybe_extMem) offset = current - matchIndex;
+                     break;   /* match found */
+                 }
+diff --git a/misc/COMPRESSED_KV_CACHE.md b/misc/COMPRESSED_KV_CACHE.md
+index 59ab943..a869790 100644
+--- a/misc/COMPRESSED_KV_CACHE.md
++++ b/misc/COMPRESSED_KV_CACHE.md
+@@ -80,6 +80,33 @@ path is left for a follow-up.
+ Both saturate by 8 P-cores.  Going wider wastes cores that could
+ run inference.  `min(8, online_cpus)` is the right default on both.
+ 
++## Vendored lz4 — local modifications
++
++`lz4.c` is upstream lz4 v1.10.0 (BSD-2-Clause) with two local edits in
++`LZ4_compress_generic_validated` (fast-mode compress). Both target the
++inner probe loop, which dominates compress wall-time on KV data:
++
++- `LZ4_skipTrigger` lowered from 6 to 4. The probe step stride ramps
++  up 4× faster on incompressible regions inside a chunk. KV state has
++  alternating compressible and incompressible runs (quantized-value
++  blocks vs activation residuals); the faster ramp also leaves the
++  hash table less polluted with stale entries, so the *next*
++  compressible run finds more matches.
++- Branchless safe-address inside the match-candidate check (zstd
++  PR #4165 idiom): redirect the load through `ip` when either of the
++  two range checks would have caused a `continue`, then issue one
++  combined branch from an OR of the three predicates.
++
++On the four real `.kv` files in this branch's measurement set, the
++two edits together deliver **+9–10% compress throughput** (e.g. 3.44
++→ 3.77 GB/s on the 640 MiB raw file at 8 threads × 16 MiB chunks)
++and a small **ratio improvement** (1.8078 → 1.8161 on the same
++file). Decompress is unaffected. Round-trip is preserved on every
++real `.kv` file we have and on lz4's own 1080-case verify suite.
++
++Marking the modifications: each edited site carries a single
++`/* ds4: ... */` comment so an upstream re-vendor diff is obvious.
++
+ ## Streaming, not snapshot
+ 
+ Compression goes through a `funopen`/`fopencookie` wrapper around
+-- 
+2.54.0
+
