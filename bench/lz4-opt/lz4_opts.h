@@ -71,6 +71,15 @@
 #define LZ4_OPT_DEC_NO_LDP 0
 #endif
 
+/* Same LDP-avoidance trick applied to LZ4_wildCopy32, which is the hot
+ * path for long-literal copies and offset>=16 long-match copies. Two
+ * separate 128-bit NEON ldr/str pairs per 32-byte iteration instead of
+ * an ldp q0,q1 / stp q0,q1. Safe: wildCopy32 runs only on disjoint
+ * literal buffers or offset>=16 match copies, so no self-overlap. */
+#ifndef LZ4_OPT_DEC_WILDCOPY_NEON
+#define LZ4_OPT_DEC_WILDCOPY_NEON 0
+#endif
+
 /* ===== Helper macros ===== */
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -92,7 +101,8 @@
 #endif
 
 #if LZ4_OPT_AARCH64 && \
-    (LZ4_OPT_DEC_TBL_REPLICATE || LZ4_OPT_DEC_VARLEN_NEON || LZ4_OPT_DEC_NO_LDP)
+    (LZ4_OPT_DEC_TBL_REPLICATE || LZ4_OPT_DEC_VARLEN_NEON || \
+     LZ4_OPT_DEC_NO_LDP || LZ4_OPT_DEC_WILDCOPY_NEON)
 #include <arm_neon.h>
 #endif
 
@@ -107,11 +117,12 @@
 #define LZ4_OPT_BANNER_FMT \
     "fast_cmov=%d ht_page_align=%d fast_pref_ht=%d " \
     "hc_pref=%d hc_inter=%d " \
-    "dec_tbl=%d dec_varlen_neon=%d dec_no_ldp=%d"
+    "dec_tbl=%d dec_varlen_neon=%d dec_no_ldp=%d dec_wildcopy_neon=%d"
 
 #define LZ4_OPT_BANNER_ARGS \
     LZ4_OPT_FAST_CMOV, LZ4_OPT_HT_PAGE_ALIGN, LZ4_OPT_FAST_PREFETCH_HT, \
     LZ4_OPT_HC_PREFETCH, LZ4_OPT_HC_INTERLEAVE, \
-    LZ4_OPT_DEC_TBL_REPLICATE, LZ4_OPT_DEC_VARLEN_NEON, LZ4_OPT_DEC_NO_LDP
+    LZ4_OPT_DEC_TBL_REPLICATE, LZ4_OPT_DEC_VARLEN_NEON, LZ4_OPT_DEC_NO_LDP, \
+    LZ4_OPT_DEC_WILDCOPY_NEON
 
 #endif /* LZ4_OPTS_H */

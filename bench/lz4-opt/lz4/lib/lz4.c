@@ -526,7 +526,39 @@ LZ4_wildCopy32(void* dstPtr, const void* srcPtr, void* dstEnd)
     const BYTE* s = (const BYTE*)srcPtr;
     BYTE* const e = (BYTE*)dstEnd;
 
+#if LZ4_OPT_AARCH64 && LZ4_OPT_DEC_WILDCOPY_NEON
+    /* Inline asm forces individual ldr q / str q ops instead of the
+     * ldp q0,q1 / stp q0,q1 that clang fuses from the 16+16 memcpys.
+     * On Apple Silicon, store-to-load forwarding does NOT fire through
+     * ldp/stp (Lemire 2024); single-quadword ldr/str preserves it,
+     * which matters for wildCopy32 because the next-iteration load
+     * often reads bytes the previous iteration just wrote (e.g. long
+     * literal copies feeding into a back-reference match).
+     *
+     * We tried `vld1q_u8`+`vst1q_u8` with an "asm volatile memory"
+     * barrier between the two pairs - clang re-fuses anyway during
+     * post-isel rescheduling. Hand-written asm is the only reliable
+     * way to keep them as separate instructions.
+     *
+     * Safe: wildCopy32 callers pass either disjoint literal buffers
+     * or offset>=16 match copies, so no self-overlap.
+     */
+    do {
+        uint8x16_t v0, v1;
+        __asm__ __volatile__(
+            "ldr  %q[v0], [%[s]]        \n\t"
+            "str  %q[v0], [%[d]]        \n\t"
+            "ldr  %q[v1], [%[s], #16]   \n\t"
+            "str  %q[v1], [%[d], #16]   \n\t"
+            : [v0] "=&w"(v0), [v1] "=&w"(v1)
+            : [d]  "r"(d),    [s]  "r"(s)
+            : "memory"
+        );
+        d += 32; s += 32;
+    } while (d < e);
+#else
     do { LZ4_memcpy(d,s,16); LZ4_memcpy(d+16,s+16,16); d+=32; s+=32; } while (d<e);
+#endif
 }
 
 #if LZ4_OPT_AARCH64 && LZ4_OPT_DEC_TBL_REPLICATE
@@ -2282,13 +2314,23 @@ LZ4_decompress_generic(
                         assert(op + 18 <= oend);
 
 #if LZ4_OPT_AARCH64 && LZ4_OPT_DEC_NO_LDP
-                        /* Single 128-bit NEON load+store avoids the ldp/stp
-                         * pair instruction that Clang otherwise emits for the
-                         * 8+8 memcpy pattern. On Apple Silicon store-to-load
-                         * forwarding does not fire through ldp/stp, so this
-                         * preserves forwarding for the next iteration's
-                         * dependent reads (Lemire 2024). */
-                        vst1q_u8(op, vld1q_u8(match));
+                        /* Two sequential 64-bit NEON loads/stores. Clang
+                         * fuses the original 8+8 memcpys into ldp/stp, which
+                         * skips store-to-load forwarding on Apple Silicon
+                         * (Lemire 2024) - the second iteration's dependent
+                         * read then eats 3-5 cycle L1 latency instead of
+                         * forwarding in 1.
+                         *
+                         * Using vld1_u8/vst1_u8 (single doubleword) keeps
+                         * the operations as separate ldr/str instructions
+                         * (no fusion), which preserves both:
+                         *   (a) forwarding eligibility, and
+                         *   (b) the offset==8 self-replication idiom -
+                         *       the second load semantically observes the
+                         *       first store, so when offset∈[8..15] the
+                         *       output pattern is correct. */
+                        vst1_u8(op,   vld1_u8(match));
+                        vst1_u8(op+8, vld1_u8(match+8));
                         LZ4_memcpy(op+16, match+16, 2);
 #else
                         LZ4_memcpy(op, match, 8);

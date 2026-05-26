@@ -84,7 +84,11 @@ int main(void) {
         "random", "ascii", "repetitive", "json", "mixed",
         "q4", "q8", "f16", "bf16", "kvcache"
     };
-    static const size_t sizes[] = { 64, 256, 4096, 65536, 1024*1024 };
+    /* Sizes/blocks chosen to exercise the same offset distribution the bench
+     * sees. The dec_no_ldp opt was found to break only at offset∈[8..15],
+     * which only fires from kvcache:16M / 4 KB block - earlier verify sets
+     * topped out at 1 MB and missed it. */
+    static const size_t sizes[]  = { 64, 256, 4096, 65536, 1024*1024, 16*1024*1024 };
     static const size_t blocks[] = { 64, 4096, 16384, 65536, 1024*1024 };
     static const int    levels[] = { 0, 1, 3, 6, 9, 12 };
 
