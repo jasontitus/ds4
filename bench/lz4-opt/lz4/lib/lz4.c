@@ -1119,12 +1119,17 @@ LZ4_FORCE_INLINE int LZ4_compress_generic_validated(
                 LZ4_putIndexOnHash(current, h, cctx->hashTable, tableType);
 
 #if LZ4_OPT_FAST_PREFETCH_HT
-                /* Warm the next hash bucket while we work on this one.
-                 * forwardH is the hash for the next probe; the exact slot
-                 * size differs between byU32/byU16 but both live inside
-                 * cctx->hashTable, so a single line prefetch covers it. */
-                LZ4_OPT_PREFETCH((const char *)cctx->hashTable
-                                 + ((size_t)forwardH << 2));
+                /* Warm the cache line containing the next hash bucket. The
+                 * per-entry stride differs between byU16 (u16 entries) and
+                 * byU32 (u32 entries); tableType is a compile-time constant
+                 * in this FORCE_INLINE'd template so the branch folds away.
+                 * LZ4_hash{4,5} already shift forwardH down to hashLog bits
+                 * so we're guaranteed in-bounds for the active table type. */
+                {
+                    size_t const stride = (tableType == byU16) ? 2u : 4u;
+                    LZ4_OPT_PREFETCH((const char *)cctx->hashTable
+                                     + (size_t)forwardH * stride);
+                }
 #endif
 
                 DEBUGLOG(7, "candidate at pos=%u  (offset=%u \n", matchIndex, current - matchIndex);

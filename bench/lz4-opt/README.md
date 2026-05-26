@@ -30,6 +30,14 @@ python3 scripts/run_grid.py --mode custom \
 
 Results land in `results/grid-<timestamp>.{jsonl,md}`.
 
+## See also
+
+**[`OPTIMIZATIONS.md`](OPTIMIZATIONS.md)** is the full reference for every
+`LZ4_OPT_*` flag: what it does, where it lives in the source, the published
+research it's based on, what we've observed on Apple Silicon so far, and
+what's worth investigating next. Read that before picking an opt to dig
+into.
+
 ## Layout
 
 ```

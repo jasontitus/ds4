@@ -1104,18 +1104,23 @@ LZ4HC_InsertAndGetWiderMatch (
         }
 #endif
 #if LZ4_OPT_HC_INTERLEAVE
-        /* Look 1 link further ahead: speculatively follow the chain and
-         * prefetch both the next-next source data and the next-next chain
-         * entry. This exposes ~2x deeper memory-level parallelism on wide
-         * OoO cores (M-series load queue is ~130 entries). */
+        /* Look one chain link further ahead. The next iteration will read
+         * chainTable[matchIndex + matchChainPos]; speculatively follow it
+         * and prefetch the source data the iteration AFTER that will touch.
+         *
+         * Carefully bounded: peek_delta must not just be ≤ matchIndex (so
+         * subtraction doesn't underflow), it must leave peek ≥ lowestMatchIndex
+         * (otherwise that iteration would exit and we'd be prefetching a wild
+         * pointer — the bug version did this and tanked HC9 by ~60% from TLB
+         * walks on garbage addresses). */
         if (matchIndex >= prefixIdx && matchIndex >= lowestMatchIndex) {
             U16 const peek_delta = DELTANEXTU16(chainTable, matchIndex + matchChainPos);
-            if (peek_delta != 0 && peek_delta <= matchIndex) {
+            if (peek_delta != 0
+                && peek_delta <= matchIndex
+                && (matchIndex - peek_delta) >= lowestMatchIndex
+                && (matchIndex - peek_delta) >= prefixIdx) {
                 U32 const peek = matchIndex - peek_delta;
-                if (peek >= prefixIdx) {
-                    LZ4_OPT_PREFETCH(prefixPtr + (peek - prefixIdx));
-                    LZ4_OPT_PREFETCH((const char *)&chainTable[peek + matchChainPos]);
-                }
+                LZ4_OPT_PREFETCH(prefixPtr + (peek - prefixIdx));
             }
         }
 #endif

@@ -54,24 +54,30 @@ OPTS = [
 # - q4/q8/f16/bf16/kvcache: ds4-shaped data (quantized weights + activations
 #   + block-structured KV cache rows)
 # - mixed: a sanity blend of the first four
+#
+# Corpus sizes are chosen so each measured iteration takes ≥500 μs even at
+# Apple Silicon's ~22 GB/s "fast bail-out" throughput. Below that, the
+# clock_gettime granularity at very high MB/s rounds adjacent samples to
+# the same value and median-collapses single-tick differences.
 DEFAULT_BENCHES = [
-    ("ascii-1M-blk64k",     ["--synth", "ascii:1048576"],      65536, 0),
-    ("ascii-1M-blk4k",      ["--synth", "ascii:1048576"],       4096, 0),
-    ("repet-1M-blk64k",     ["--synth", "repetitive:1048576"], 65536, 0),
-    ("json-1M-blk64k",      ["--synth", "json:1048576"],       65536, 0),
-    ("random-1M-blk64k",    ["--synth", "random:1048576"],     65536, 0),
-    ("mixed-4M-blk64k",     ["--synth", "mixed:4194304"],      65536, 0),
-    # ds4-shaped data
-    ("q4-2M-blk64k",        ["--synth", "q4:2097152"],         65536, 0),
-    ("q8-2M-blk64k",        ["--synth", "q8:2097152"],         65536, 0),
-    ("f16-2M-blk64k",       ["--synth", "f16:2097152"],        65536, 0),
-    ("bf16-2M-blk64k",      ["--synth", "bf16:2097152"],       65536, 0),
-    ("kvcache-4M-blk64k",   ["--synth", "kvcache:4194304"],    65536, 0),
-    ("kvcache-4M-blk4k",    ["--synth", "kvcache:4194304"],     4096, 0),
+    # General-purpose
+    ("ascii-4M-blk64k",       ["--synth", "ascii:4194304"],       65536, 0),
+    ("ascii-4M-blk4k",        ["--synth", "ascii:4194304"],        4096, 0),
+    ("repet-4M-blk64k",       ["--synth", "repetitive:4194304"],  65536, 0),
+    ("json-4M-blk64k",        ["--synth", "json:4194304"],        65536, 0),
+    ("random-16M-blk64k",     ["--synth", "random:16777216"],     65536, 0),
+    ("mixed-16M-blk64k",      ["--synth", "mixed:16777216"],      65536, 0),
+    # ds4-shaped data (larger because q4/q8/random bail out at ~22 GB/s on M-series)
+    ("q4-16M-blk64k",         ["--synth", "q4:16777216"],         65536, 0),
+    ("q8-16M-blk64k",         ["--synth", "q8:16777216"],         65536, 0),
+    ("f16-8M-blk64k",         ["--synth", "f16:8388608"],         65536, 0),
+    ("bf16-8M-blk64k",        ["--synth", "bf16:8388608"],        65536, 0),
+    ("kvcache-16M-blk64k",    ["--synth", "kvcache:16777216"],    65536, 0),
+    ("kvcache-16M-blk4k",     ["--synth", "kvcache:16777216"],     4096, 0),
     # HC at level 9 to exercise the chain-walk opts
-    ("ascii-1M-HC9-blk64k", ["--synth", "ascii:1048576"],      65536, 9),
-    ("json-1M-HC9-blk64k",  ["--synth", "json:1048576"],       65536, 9),
-    ("kvcache-2M-HC9-blk64k", ["--synth", "kvcache:2097152"],  65536, 9),
+    ("ascii-4M-HC9-blk64k",   ["--synth", "ascii:4194304"],       65536, 9),
+    ("json-4M-HC9-blk64k",    ["--synth", "json:4194304"],        65536, 9),
+    ("kvcache-8M-HC9-blk64k", ["--synth", "kvcache:8388608"],     65536, 9),
 ]
 
 
@@ -245,8 +251,10 @@ def main():
                     help="restrict the opt set considered (default: all known opts)")
     ap.add_argument("--custom", nargs="*", default=[],
                     help="for --mode=custom: comma-separated flag sets, e.g. 'A,B' 'C'")
-    ap.add_argument("--iters", type=int, default=11)
-    ap.add_argument("--warmup", type=int, default=3)
+    ap.add_argument("--iters", type=int, default=25,
+                    help="measurement iterations per bench (default: 25)")
+    ap.add_argument("--warmup", type=int, default=5,
+                    help="warmup iterations to discard (default: 5)")
     ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--results", default="results")
     ap.add_argument("--skip-verify", action="store_true",
