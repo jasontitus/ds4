@@ -34,7 +34,11 @@ endif
 # Base flags. -O3, native tune, no asserts in benchmarking. -fno-builtin-memcpy
 # was considered but rejected: LZ4 relies on inline-able memcpy for the fast
 # decode loop, so leave it on.
-BASE_CFLAGS ?= -O3 -std=c99 -D_POSIX_C_SOURCE=199309L -Wall -Wextra -Wno-unused-parameter $(NATIVE_FLAG)
+# _POSIX_C_SOURCE=200809L is required so that macOS / Darwin headers expose
+# both clock_gettime (POSIX.1-2001) and snprintf (which Darwin gates behind
+# this level). 199309L is enough on Linux but hides snprintf in Darwin's
+# stdio.h under strict POSIX mode.
+BASE_CFLAGS ?= -O3 -std=c99 -D_POSIX_C_SOURCE=200809L -Wall -Wextra -Wno-unused-parameter $(NATIVE_FLAG)
 CFLAGS_ALL  := $(BASE_CFLAGS) $(OPT_CFLAGS) $(CFLAGS)
 CPPFLAGS_ALL := -I. -I$(LZ4_DIR) $(CPPFLAGS)
 LDLIBS_ALL  := -lm $(LDLIBS)

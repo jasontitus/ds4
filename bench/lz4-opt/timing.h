@@ -1,9 +1,9 @@
 #ifndef BENCH_TIMING_H
 #define BENCH_TIMING_H
 
-#if !defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 199309L
+#if !defined(_POSIX_C_SOURCE) || _POSIX_C_SOURCE < 200809L
 #  undef _POSIX_C_SOURCE
-#  define _POSIX_C_SOURCE 199309L
+#  define _POSIX_C_SOURCE 200809L
 #endif
 
 #include <stdint.h>
