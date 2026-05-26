@@ -774,7 +774,13 @@ unsigned LZ4_count(const BYTE* pIn, const BYTE* pMatch, const BYTE* pInLimit)
 *  Local Constants
 **************************************/
 static const int LZ4_64Klimit = ((64 KB) + (MFLIMIT-1));
+#if LZ4_OPT_FAST_SKIP4
+static const U32 LZ4_skipTrigger = 4;
+#elif LZ4_OPT_FAST_SKIP5
+static const U32 LZ4_skipTrigger = 5;
+#else
 static const U32 LZ4_skipTrigger = 6;  /* Increase this value ==> compression run slower on incompressible data */
+#endif
 
 
 /*-************************************
@@ -1091,7 +1097,16 @@ LZ4_FORCE_INLINE int LZ4_compress_generic_validated(
                 U32 const h = forwardH;
                 ip = forwardIp;
                 forwardIp += step;
+#if LZ4_OPT_FAST_SKIP_ADAPTIVE
+                /* Default ramp until 256 consecutive misses; then promote
+                 * to skip4 ramp. Branch is well-predicted (always-false in
+                 * compressible code, always-true once we're in an
+                 * incompressible run). */
+                step = (searchMatchNb > 256) ? (searchMatchNb++ >> 4)
+                                             : (searchMatchNb++ >> LZ4_skipTrigger);
+#else
                 step = (searchMatchNb++ >> LZ4_skipTrigger);
+#endif
 
                 if (unlikely(forwardIp > mflimitPlusOne)) goto _last_literals;
                 assert(ip < mflimitPlusOne);
@@ -1116,7 +1131,12 @@ LZ4_FORCE_INLINE int LZ4_compress_generic_validated(
                 assert(forwardIp - base < (ptrdiff_t)(2 GB - 1));
                 ip = forwardIp;
                 forwardIp += step;
+#if LZ4_OPT_FAST_SKIP_ADAPTIVE
+                step = (searchMatchNb > 256) ? (searchMatchNb++ >> 4)
+                                             : (searchMatchNb++ >> LZ4_skipTrigger);
+#else
                 step = (searchMatchNb++ >> LZ4_skipTrigger);
+#endif
 
                 if (unlikely(forwardIp > mflimitPlusOne)) goto _last_literals;
                 assert(ip < mflimitPlusOne);
@@ -1162,6 +1182,11 @@ LZ4_FORCE_INLINE int LZ4_compress_generic_validated(
                     LZ4_OPT_PREFETCH((const char *)cctx->hashTable
                                      + (size_t)forwardH * stride);
                 }
+#endif
+#if LZ4_OPT_FAST_SRC_PREFETCH
+                /* Pull a cache line of source 256B ahead so subsequent
+                 * forwardIp loads on incompressible streams don't stall. */
+                if (forwardIp + 256 <= mflimitPlusOne) LZ4_OPT_PREFETCH(forwardIp + 256);
 #endif
 
                 DEBUGLOG(7, "candidate at pos=%u  (offset=%u \n", matchIndex, current - matchIndex);

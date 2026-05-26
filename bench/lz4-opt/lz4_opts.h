@@ -36,6 +36,37 @@
 #define LZ4_OPT_HT_PAGE_ALIGN 0
 #endif
 
+/* Lower LZ4_skipTrigger from 6 to 5 so the step stride ramps up 2x faster
+ * on incompressible input. Real ds4 KV cache data at 16 MiB blocks is
+ * incompressible, so the inner probe loop in fast-mode compress dominates;
+ * a steeper ramp cuts ~25% of hash computations per byte advanced. */
+#ifndef LZ4_OPT_FAST_SKIP5
+#define LZ4_OPT_FAST_SKIP5 0
+#endif
+
+/* Even more aggressive: skipTrigger=4 (4x faster ramp). May lose ratio on
+ * borderline-compressible data; benched against real cache to confirm. */
+#ifndef LZ4_OPT_FAST_SKIP4
+#define LZ4_OPT_FAST_SKIP4 0
+#endif
+
+/* Prefetch the source buffer 256 bytes ahead of forwardIp on every probe.
+ * The hash-table prefetch (LZ4_OPT_FAST_PREFETCH_HT) covers the next hash
+ * bucket; this covers the source read that follows. */
+#ifndef LZ4_OPT_FAST_SRC_PREFETCH
+#define LZ4_OPT_FAST_SRC_PREFETCH 0
+#endif
+
+/* Adaptive skip: keep the default skipTrigger=6 ramp until searchMatchNb
+ * has crossed 256 (we've burned 256 misses, so this block is incompressible
+ * for some prefix), then promote to the aggressive skip4 ramp. Preserves
+ * full ratio on compressible streams (skip never gets that far) while
+ * still hitting skip4 speed on incompressible blocks once enough probes
+ * have failed. */
+#ifndef LZ4_OPT_FAST_SKIP_ADAPTIVE
+#define LZ4_OPT_FAST_SKIP_ADAPTIVE 0
+#endif
+
 /* ===== LZ4-HC experiments ===== */
 
 /* Prefetch ahead in the chainTable during LZ4HC_InsertAndGetWiderMatch. */
@@ -116,11 +147,13 @@
  * unambiguously tied to the flag set it was built with. */
 #define LZ4_OPT_BANNER_FMT \
     "fast_cmov=%d ht_page_align=%d fast_pref_ht=%d " \
+    "skip5=%d skip4=%d src_pref=%d " \
     "hc_pref=%d hc_inter=%d " \
     "dec_tbl=%d dec_varlen_neon=%d dec_no_ldp=%d dec_wildcopy_neon=%d"
 
 #define LZ4_OPT_BANNER_ARGS \
     LZ4_OPT_FAST_CMOV, LZ4_OPT_HT_PAGE_ALIGN, LZ4_OPT_FAST_PREFETCH_HT, \
+    LZ4_OPT_FAST_SKIP5, LZ4_OPT_FAST_SKIP4, LZ4_OPT_FAST_SRC_PREFETCH, \
     LZ4_OPT_HC_PREFETCH, LZ4_OPT_HC_INTERLEAVE, \
     LZ4_OPT_DEC_TBL_REPLICATE, LZ4_OPT_DEC_VARLEN_NEON, LZ4_OPT_DEC_NO_LDP, \
     LZ4_OPT_DEC_WILDCOPY_NEON
