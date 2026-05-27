@@ -157,7 +157,151 @@ upfront (the engine streams into the cookie).  Either (a) buffer the
 first N bytes and switch to no-compress if EOF arrives before
 threshold, or (b) introduce a hint argument when opening the writer.
 
-## Optimization 4 — HC sidecar (encoder change)
+## Optimization 4 — byte-4 NEON shuffle (encoder change, drop-in)
+
+**Single most promising idea from this whole exercise.**  Apply a
+4-byte position transpose to each chunk before LZ4, undo it after
+decompress.  Real KV data appears to be laid out in 4-byte aligned
+blocks (quantized weights packed in 32-bit groups; bf16 pairs;
+attention activations) — separating the byte streams gives LZ4 much
+longer match runs.
+
+Implementation: NEON `vld4q_u8` / `vst4q_u8` (4-way de-interleave
+instructions on AArch64) make shuffle/unshuffle essentially free vs
+memory bandwidth.  Scalar fallback ~3× slower.  ~50 lines total.
+
+Measured on real raw KV bytes, 8 threads, 16 MiB chunks, NEON
+byte-4 shuffle on every variant (`shuffle_mt_test.c`):
+
+### 246 MiB raw
+
+| level | ratio | C MB/s (agg) | D MB/s (agg) |
+|---|---:|---:|---:|
+| lz4-1 (today, no shuf) | 1.76× | 3441 | 22697 |
+| lz4-1 + shuf | 2.10× | 5441 | 22110 |
+| HC1 / HC2 + shuf | 2.30× | 3165 / 3195 | 22772 / 21539 |
+| HC3 + shuf | 2.48× | 871 | 21009 |
+| HC6 + shuf | 2.65× | 389 | 23192 |
+| HC9 + shuf | 2.71× | 124 | 22604 |
+
+### 640 MiB raw (the 47K-token A/B file)
+
+| level | ratio | C MB/s (agg) | D MB/s (agg) |
+|---|---:|---:|---:|
+| lz4-1 (today, no shuf) | 1.81× | 3441 | 22697 |
+| lz4-1 + shuf | 2.16× | 5911 | 25031 |
+| **HC1 / HC2 + shuf** | **2.39×** | **3341 / 3317** | **25004 / 24482** |
+| HC3 + shuf | 2.58× | 943 | 22497 |
+| HC6 + shuf | 2.77× | 409 | 24731 |
+| HC9 + shuf | 2.84× | 129 | 25280 |
+
+Notes:
+
+- **HC1 ≡ HC2** — LZ4's HC encoder clamps level <3 internally; both
+  produce byte-identical output.  Effectively "HC at level 1" is a
+  distinct operating point worth knowing about.
+- **Decompress is memory-bandwidth-bound at every level** (~22–25
+  GB/s aggregate), so encoding choice doesn't affect load time.
+  Only encode time changes.
+- **HC9 → HC12 buys ~+0.07× ratio for ~5× slower compress** — HC9
+  is the practical max useful level; HC12 isn't worth shipping.
+
+### Save blocks generation — what's actually inline-able today
+
+`ds4_kvstore_store_live_prefix_text` is synchronous on the worker
+thread that also drives generation.  Two save paths exist:
+
+**Cold save** (between stable-prefix prefill and full prefill, before
+the first token): the user is already waiting for prefill anyway.
+Save time as fraction of the cold wait, for the 47K-token case
+(~225 s prefill total):
+
+| variant | save time | % of cold wait |
+|---|---:|---:|
+| today (lz4-1, no shuf) | 0.36 s | 0.16% |
+| HC1 + shuf | 0.19 s | 0.08% |
+| HC3 + shuf | 0.71 s | 0.32% |
+| HC6 + shuf | 1.6 s | 0.71% |
+| HC9 + shuf | 5.2 s | 2.31% |
+
+All inline-able on cold save — user notices ~zero difference even at
+HC9.
+
+**Continued save** (fires every ~10 K tokens during a long
+conversation): synchronous on the worker, so it stalls generation
+for the save duration.  At 20 tps users expect a token every 50 ms,
+so save time directly maps to "missed token slots":
+
+| variant | save time | missed token slots |
+|---|---:|---:|
+| today | 359 ms | ~7 (noticeable hiccup) |
+| HC1 + shuf | ~190 ms | **~4 (smaller hiccup than today)** |
+| HC3 + shuf | 710 ms | ~14 (worse than today) |
+| HC6 + shuf | 1.6 s | ~32 (multi-second stall) |
+| HC9 + shuf | 5.2 s | ~100 (bad) |
+
+So HC3 and above are not OK for continued saves unless we first make
+the continued-save path **async** — snapshot the live KV state at
+the save trigger (~640 MiB memcpy ≈ 80 ms on M1 Ultra memory
+bandwidth, one-shot), then save streams from the snapshot in the
+background while generation continues uninterrupted.  ~50 lines in
+`ds4_kvstore.c`, requires holding 2× the chunk batch in RAM during
+save.
+
+### Recommended sequence — go to HC1 + shuf
+
+HC1 is the only operating point that's a **strict upgrade** to the
+current codec across both save paths AND load:
+
+| metric | today (lz4-1, no shuf) | HC1 + byte-4 shuf | delta |
+|---|---:|---:|---:|
+| compression ratio | 1.81× | 2.39× | **+32% smaller files** |
+| compress agg @ 8 thr | 3441 MB/s | 3341 MB/s | −3% (within noise) |
+| decompress agg @ 8 thr | 22697 MB/s | 25004 MB/s | +10% |
+| inline cold-save cost | 0.36 s | 0.19 s | **faster** |
+| continued-save hiccup | ~360 ms | ~190 ms | **smaller hiccup** |
+
+Implementation plan:
+
+1. **Link `lz4hc.c` into ds4** (single line in `Makefile`; currently
+   only `lz4.c` is linked).
+2. **Add byte-4 NEON shuffle helpers** in `ds4_kvstore.c` —
+   `shuffle_byte4_neon` / `unshuffle_byte4_neon` (with scalar
+   fallback for non-AArch64 builds).  ~50 lines.
+3. **Swap `LZ4_compress_default` for `LZ4_compress_HC(..., 1)` in
+   `kv_lz4_compress_worker`**, and call the shuffle helper on the
+   input first.
+4. **Mirror on the reader**: call the unshuffle helper after
+   `LZ4_decompress_safe` in `kv_lz4_async_decompress_worker`.
+5. **On-disk format unchanged** — codec byte stays `LZ4`; the
+   reader doesn't need to know what level encoded it (the bytes
+   decompress the same way).  Shuffle/unshuffle is just an
+   extra ~50-line transform on both sides.
+
+Estimated total diff: ~120 lines in `ds4_kvstore.c` + 1 line in
+`Makefile`.  No format change, no migration needed (old files load
+unchanged because they were lz4-1 + no-shuffle, which is what
+unshuffle-with-zero-effect produces if codec byte signals "no
+shuffle").
+
+If we want to expose this without breaking format compatibility, the
+cleanest knob is to **reuse a reserved bit in the header** to signal
+"this file was byte-4 shuffled before lz4."  v1 files (current
+codec) have that bit as 0 and round-trip with no unshuffle pass.
+
+### Larger savings (not pursued, parked for later)
+
+| variant | extra disk savings vs today | inline? |
+|---|---:|---|
+| `HC3 + shuf` | +42% | cold-save only (continued stall too long) |
+| `HC6 + shuf` | +53% | sidecar only |
+| `HC9 + shuf` | +57% | sidecar only |
+
+These are open routes once `HC1 + shuf` ships and we know the format
+extension works.  Going past HC1 requires either bigger user-visible
+saves or async continued-save.
+
+## Optimization 5 — HC sidecar (encoder change)
 
 Already covered in the PR's "Future HC via out-of-band recompressor"
 section.  HC-encoded files (with the same on-disk format byte set to
