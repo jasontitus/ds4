@@ -285,6 +285,11 @@ kernel void kernel_laguna_attention_prefill_gqa_f16(
     float4 acc = float4(0.0f);
     float max_score = -INFINITY;
     float score_sum = 0.0f;
+    /* The query row is loop-invariant: keep this lane's slice in registers
+     * instead of re-reading four device values per key.  The accumulation
+     * order matches the strided loop it replaces. */
+    const float4 qr = float4(qh[lane], qh[lane + 32u],
+                             qh[lane + 64u], qh[lane + 96u]);
     for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
@@ -293,13 +298,12 @@ kernel void kernel_laguna_attention_prefill_gqa_f16(
             (uint64_t)source_row * cache_width +
             (uint64_t)kv_head * args.head_dim;
 
+        device const half *krow = current ? staged_key : key_cache;
         float partial = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            const float key_value = current ?
-                (float)staged_key[kv_base + d] :
-                (float)key_cache[kv_base + d];
-            partial += qh[d] * key_value;
-        }
+        partial += qr.x * (float)krow[kv_base + lane];
+        partial += qr.y * (float)krow[kv_base + lane + 32u];
+        partial += qr.z * (float)krow[kv_base + lane + 64u];
+        partial += qr.w * (float)krow[kv_base + lane + 96u];
         const float score = simd_sum(partial) * args.scale;
         const float next_max = max(max_score, score);
         const float old_scale = max_score == -INFINITY ?
@@ -377,6 +381,14 @@ kernel void kernel_laguna_attention_prefill_gqa3_f16(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
+    /* Loop-invariant query slices live in registers; the strided d loop is
+     * unrolled with its accumulation order preserved. */
+    const float4 qr0 = float4(qh0[lane], qh0[lane + 32u],
+                              qh0[lane + 64u], qh0[lane + 96u]);
+    const float4 qr1 = float4(qh1[lane], qh1[lane + 32u],
+                              qh1[lane + 64u], qh1[lane + 96u]);
+    const float4 qr2 = float4(qh2[lane], qh2[lane + 32u],
+                              qh2[lane + 64u], qh2[lane + 96u]);
     for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
@@ -385,17 +397,26 @@ kernel void kernel_laguna_attention_prefill_gqa3_f16(
             (uint64_t)source_row * cache_width +
             (uint64_t)kv_head * args.head_dim;
 
+        device const half *krow = current ? staged_key : key_cache;
+        const float4 key = float4((float)krow[kv_base + lane],
+                                  (float)krow[kv_base + lane + 32u],
+                                  (float)krow[kv_base + lane + 64u],
+                                  (float)krow[kv_base + lane + 96u]);
         float partial0 = 0.0f;
+        partial0 += qr0.x * key.x;
+        partial0 += qr0.y * key.y;
+        partial0 += qr0.z * key.z;
+        partial0 += qr0.w * key.w;
         float partial1 = 0.0f;
+        partial1 += qr1.x * key.x;
+        partial1 += qr1.y * key.y;
+        partial1 += qr1.z * key.z;
+        partial1 += qr1.w * key.w;
         float partial2 = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            const float key_value = current ?
-                (float)staged_key[kv_base + d] :
-                (float)key_cache[kv_base + d];
-            partial0 += qh0[d] * key_value;
-            partial1 += qh1[d] * key_value;
-            partial2 += qh2[d] * key_value;
-        }
+        partial2 += qr2.x * key.x;
+        partial2 += qr2.y * key.y;
+        partial2 += qr2.z * key.z;
+        partial2 += qr2.w * key.w;
         const float score0 = simd_sum(partial0) * args.scale;
         const float score1 = simd_sum(partial1) * args.scale;
         const float score2 = simd_sum(partial2) * args.scale;
@@ -518,6 +539,20 @@ kernel void kernel_laguna_attention_prefill_gqa6_f16(
     float sum3 = 0.0f;
     float sum4 = 0.0f;
     float sum5 = 0.0f;
+    /* Loop-invariant query slices live in registers; the strided d loop is
+     * unrolled with each head's accumulation order preserved. */
+    const float4 qr0 = float4(qh0[lane], qh0[lane + 32u],
+                              qh0[lane + 64u], qh0[lane + 96u]);
+    const float4 qr1 = float4(qh1[lane], qh1[lane + 32u],
+                              qh1[lane + 64u], qh1[lane + 96u]);
+    const float4 qr2 = float4(qh2[lane], qh2[lane + 32u],
+                              qh2[lane + 64u], qh2[lane + 96u]);
+    const float4 qr3 = float4(qh3[lane], qh3[lane + 32u],
+                              qh3[lane + 64u], qh3[lane + 96u]);
+    const float4 qr4 = float4(qh4[lane], qh4[lane + 32u],
+                              qh4[lane + 64u], qh4[lane + 96u]);
+    const float4 qr5 = float4(qh5[lane], qh5[lane + 32u],
+                              qh5[lane + 64u], qh5[lane + 96u]);
     for (uint key_pos = key_start; key_pos <= query_pos; key_pos++) {
         const bool current = key_pos >= args.pos0;
         const uint source_row = current ?
@@ -526,23 +561,41 @@ kernel void kernel_laguna_attention_prefill_gqa6_f16(
             (uint64_t)source_row * cache_width +
             (uint64_t)kv_head * args.head_dim;
 
+        device const half *krow = current ? staged_key : key_cache;
+        const float4 key = float4((float)krow[kv_base + lane],
+                                  (float)krow[kv_base + lane + 32u],
+                                  (float)krow[kv_base + lane + 64u],
+                                  (float)krow[kv_base + lane + 96u]);
         float partial0 = 0.0f;
+        partial0 += qr0.x * key.x;
+        partial0 += qr0.y * key.y;
+        partial0 += qr0.z * key.z;
+        partial0 += qr0.w * key.w;
         float partial1 = 0.0f;
+        partial1 += qr1.x * key.x;
+        partial1 += qr1.y * key.y;
+        partial1 += qr1.z * key.z;
+        partial1 += qr1.w * key.w;
         float partial2 = 0.0f;
+        partial2 += qr2.x * key.x;
+        partial2 += qr2.y * key.y;
+        partial2 += qr2.z * key.z;
+        partial2 += qr2.w * key.w;
         float partial3 = 0.0f;
+        partial3 += qr3.x * key.x;
+        partial3 += qr3.y * key.y;
+        partial3 += qr3.z * key.z;
+        partial3 += qr3.w * key.w;
         float partial4 = 0.0f;
+        partial4 += qr4.x * key.x;
+        partial4 += qr4.y * key.y;
+        partial4 += qr4.z * key.z;
+        partial4 += qr4.w * key.w;
         float partial5 = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            const float key_value = current ?
-                (float)staged_key[kv_base + d] :
-                (float)key_cache[kv_base + d];
-            partial0 += qh0[d] * key_value;
-            partial1 += qh1[d] * key_value;
-            partial2 += qh2[d] * key_value;
-            partial3 += qh3[d] * key_value;
-            partial4 += qh4[d] * key_value;
-            partial5 += qh5[d] * key_value;
-        }
+        partial5 += qr5.x * key.x;
+        partial5 += qr5.y * key.y;
+        partial5 += qr5.z * key.z;
+        partial5 += qr5.w * key.w;
         const float score0 = simd_sum(partial0) * args.scale;
         const float score1 = simd_sum(partial1) * args.scale;
         const float score2 = simd_sum(partial2) * args.scale;
@@ -747,29 +800,28 @@ kernel void kernel_laguna_attention_decode_gqa3_split_f16(
     float sum0 = 0.0f;
     float sum1 = 0.0f;
     float sum2 = 0.0f;
+    /* The query rows are loop-invariant: keep this lane's slice in registers
+     * instead of re-reading twelve device values per key. */
+    const uint d0 = lane;
+    const float4 q0 = float4(qh0[d0], qh0[d0 + 32u],
+                             qh0[d0 + 64u], qh0[d0 + 96u]);
+    const float4 q1 = float4(qh1[d0], qh1[d0 + 32u],
+                             qh1[d0 + 64u], qh1[d0 + 96u]);
+    const float4 q2 = float4(qh2[d0], qh2[d0 + 32u],
+                             qh2[d0 + 64u], qh2[d0 + 96u]);
     const uint first = iwg * args.nsg + simd_group;
     const uint stride = args.nwg * args.nsg;
     for (uint i = first; i < key_count; i += stride) {
         const uint64_t kv_base =
             (uint64_t)i * cache_width +
             (uint64_t)kv_head * args.head_dim;
-        const uint d0 = lane;
         const float4 key = float4((float)key_cache[kv_base + d0],
                                   (float)key_cache[kv_base + d0 + 32u],
                                   (float)key_cache[kv_base + d0 + 64u],
                                   (float)key_cache[kv_base + d0 + 96u]);
-        const float score0 = simd_sum(dot(float4(qh0[d0],
-                                                   qh0[d0 + 32u],
-                                                   qh0[d0 + 64u],
-                                                   qh0[d0 + 96u]), key)) * args.scale;
-        const float score1 = simd_sum(dot(float4(qh1[d0],
-                                                   qh1[d0 + 32u],
-                                                   qh1[d0 + 64u],
-                                                   qh1[d0 + 96u]), key)) * args.scale;
-        const float score2 = simd_sum(dot(float4(qh2[d0],
-                                                   qh2[d0 + 32u],
-                                                   qh2[d0 + 64u],
-                                                   qh2[d0 + 96u]), key)) * args.scale;
+        const float score0 = simd_sum(dot(q0, key)) * args.scale;
+        const float score1 = simd_sum(dot(q1, key)) * args.scale;
+        const float score2 = simd_sum(dot(q2, key)) * args.scale;
         const float next_max0 = max(max0, score0);
         const float next_max1 = max(max1, score1);
         const float next_max2 = max(max2, score2);
@@ -891,6 +943,11 @@ kernel void kernel_laguna_attention_decode_gqa_f16(
     float4 acc = float4(0.0f);
     float max_score = -INFINITY;
     float score_sum = 0.0f;
+    /* The query row is loop-invariant: keep this lane's slice in registers
+     * instead of re-reading four device values per key.  The accumulation
+     * order matches the strided loop it replaces. */
+    const float4 qr = float4(qh[lane], qh[lane + 32u],
+                             qh[lane + 64u], qh[lane + 96u]);
     const uint key_first = split ? simd_group : 0u;
     const uint key_stride = split ? split_simd_groups : 1u;
     for (uint i = key_first; i < args.key_count; i += key_stride) {
@@ -901,9 +958,10 @@ kernel void kernel_laguna_attention_decode_gqa_f16(
             (uint64_t)kv_head * args.head_dim;
 
         float partial = 0.0f;
-        for (uint d = lane; d < args.head_dim; d += 32u) {
-            partial += qh[d] * (float)key_cache[kv_base + d];
-        }
+        partial += qr.x * (float)key_cache[kv_base + lane];
+        partial += qr.y * (float)key_cache[kv_base + lane + 32u];
+        partial += qr.z * (float)key_cache[kv_base + lane + 64u];
+        partial += qr.w * (float)key_cache[kv_base + lane + 96u];
         const float score = simd_sum(partial) * args.scale;
         const float next_max = max(max_score, score);
         const float old_scale = max_score == -INFINITY ?
