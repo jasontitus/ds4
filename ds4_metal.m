@@ -31320,7 +31320,7 @@ int ds4_gpu_laguna_head_rms_norm_rope_tensor(
         [enc setBytes:&args length:sizeof(args) atIndex:0];
         [enc setBuffer:xbuf offset:ds4_gpu_tensor_offset(x) atIndex:1];
         [enc setBuffer:weightbuf offset:(NSUInteger)weight_inner atIndex:2];
-        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:129u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_head, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);
@@ -31421,7 +31421,7 @@ int ds4_gpu_laguna_qk_head_rms_norm_rope_tensor(
         [enc setBuffer:q_weightbuf offset:(NSUInteger)q_weight_inner atIndex:3];
         [enc setBuffer:k_weightbuf offset:(NSUInteger)k_weight_inner atIndex:4];
         [enc setBytes:&n_q_head length:sizeof(n_q_head) atIndex:5];
-        [enc setThreadgroupMemoryLength:128u * sizeof(float) atIndex:0];
+        [enc setThreadgroupMemoryLength:129u * sizeof(float) atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake(n_q_head + n_k_head, n_tokens, 1)
              threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
         ds4_gpu_end_compute_encoder(cb, enc);

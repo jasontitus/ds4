@@ -27,26 +27,68 @@ static inline void laguna_head_rms_norm_rope_neox(
         uint tid,
         uint nth,
         uint token) {
-    float ss = 0.0f;
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        const float v = row[i];
-        ss += v * v;
-    }
-    scratch[tid] = ss;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint step = nth >> 1u; step != 0u; step >>= 1u) {
-        if (tid < step) scratch[tid] += scratch[tid + step];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-
-    const float inv = rsqrt(scratch[0] / (float)args.head_dim + args.eps);
-    for (uint i = tid; i < args.head_dim; i += nth) {
-        row[i] = row[i] * inv * weight[i];
-    }
-    threadgroup_barrier(mem_flags::mem_device);
-
+    /* One thread per element on the shipped 128-wide heads.  The square
+     * staging plus the simdgroup-0 shuffle ladder reproduces the old barrier
+     * tree's pairing exactly ((a[i]+a[i+64]) + (a[i+32]+a[i+96]), then
+     * offsets 16..1), so the reduction keeps its bit pattern while three
+     * threadgroup barriers replace the nine rendezvous (one per tree level
+     * plus a device-scope fence) this kernel paid per threadgroup.  The
+     * normalized row reaches the rotation through threadgroup memory, so
+     * device memory sees one read and one write per element instead of
+     * three reads and two writes.  scratch[128] holds the reduced total,
+     * which is why the host allocates 129 floats. */
+    float normed = 0.0f;
+    float partner = 0.0f;
     const uint half_rot = args.n_rot >> 1u;
-    if (tid >= half_rot) return;
+    if (nth == 128u && args.head_dim == 128u) {
+        const float v = row[tid];
+        scratch[tid] = v * v;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid < 32u) {
+            float acc = (scratch[tid] + scratch[tid + 64u]) +
+                        (scratch[tid + 32u] + scratch[tid + 96u]);
+            acc += simd_shuffle_down(acc, 16u);
+            acc += simd_shuffle_down(acc, 8u);
+            acc += simd_shuffle_down(acc, 4u);
+            acc += simd_shuffle_down(acc, 2u);
+            acc += simd_shuffle_down(acc, 1u);
+            if (tid == 0u) scratch[128u] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float inv =
+            rsqrt(scratch[128u] / (float)args.head_dim + args.eps);
+        normed = v * inv * weight[tid];
+        scratch[tid] = normed;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid >= args.n_rot) {
+            row[tid] = normed;
+            return;
+        }
+        if (tid >= half_rot) return;
+        partner = scratch[tid + half_rot];
+    } else {
+        float ss = 0.0f;
+        for (uint i = tid; i < args.head_dim; i += nth) {
+            const float v = row[i];
+            ss += v * v;
+        }
+        scratch[tid] = ss;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint step = nth >> 1u; step != 0u; step >>= 1u) {
+            if (tid < step) scratch[tid] += scratch[tid + step];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        const float inv = rsqrt(scratch[0] / (float)args.head_dim + args.eps);
+        for (uint i = tid; i < args.head_dim; i += nth) {
+            row[i] = row[i] * inv * weight[i];
+        }
+        threadgroup_barrier(mem_flags::mem_device);
+
+        if (tid >= half_rot) return;
+        normed = row[tid];
+        partner = row[tid + half_rot];
+    }
 
     float corr_dims[2] = {0.0f, 0.0f};
     if (args.ext_factor != 0.0f) {
@@ -76,8 +118,8 @@ static inline void laguna_head_rms_norm_rope_neox(
               args.attn_factor,
               &cos_theta,
               &sin_theta);
-    const float x0 = row[tid];
-    const float x1 = row[tid + half_rot];
+    const float x0 = normed;
+    const float x1 = partner;
     row[tid] = x0 * cos_theta - x1 * sin_theta;
     row[tid + half_rot] = x0 * sin_theta + x1 * cos_theta;
 }
