@@ -49062,6 +49062,19 @@ static bool laguna_graph_forward_token(
         return false;
     }
 
+    const bool profile =
+        glm_graph_env_present("DS4_ROCM_GRAPH_TOKEN_PROFILE",
+                              "DS4_METAL_GRAPH_TOKEN_PROFILE");
+    const double t0 = profile ? now_sec() : 0.0;
+#ifdef __APPLE__
+    /* Start executing the graph prefix while the CPU is still encoding the
+     * remaining layers, like the DS4 decode split: this executor is a fixed
+     * tape, so a layer index is a stable flush point.  CUDA and ROCm map
+     * ds4_gpu_flush_commands() to a device sync, so the overlap stays
+     * Apple-only, matching the DFlash draft/verify pipelining. */
+    const uint32_t split_after_layers = metal_graph_token_split_after_layers();
+#endif
+
     bool ok = ds4_gpu_begin_commands() != 0;
     if (ok) {
         ok = ds4_gpu_embed_token_quant_tensor(g->cur,
@@ -49438,6 +49451,11 @@ static bool laguna_graph_forward_token(
             g->cur = g->next;
             g->next = tmp;
         }
+#ifdef __APPLE__
+        if (ok && split_after_layers != 0 && il + 1u == split_after_layers) {
+            ok = ds4_gpu_flush_commands() != 0;
+        }
+#endif
     }
 
     if (ok) {
@@ -49459,12 +49477,26 @@ static bool laguna_graph_forward_token(
                                      1);
         }
     }
+    const double t_encoded = profile ? now_sec() : 0.0;
     if (ds4_gpu_commands_active() && ds4_gpu_end_commands() == 0) ok = false;
+    const double t_done = profile ? now_sec() : 0.0;
     if (ok && logits_out) {
         ok = ds4_gpu_tensor_read(g->logits,
                                  0,
                                  logits_out,
                                  (uint64_t)DS4_N_VOCAB * sizeof(float)) != 0;
+    }
+    if (profile) {
+        const double t_read = now_sec();
+        fprintf(stderr,
+                "ds4: laguna graph token pos=%u encode=%.3f ms execute=%.3f ms "
+                "read=%.3f ms total=%.3f ms logits=%d\n",
+                pos,
+                (t_encoded - t0) * 1000.0,
+                (t_done - t_encoded) * 1000.0,
+                (t_read - t_done) * 1000.0,
+                (t_read - t0) * 1000.0,
+                logits_out != NULL);
     }
     return ok;
 }
