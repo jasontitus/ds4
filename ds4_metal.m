@@ -85,6 +85,7 @@ static id<MTLComputePipelineState> g_mul_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_plain_pipeline;
 static id<MTLComputePipelineState> g_add_rms_norm_pipeline;
+static id<MTLComputePipelineState> g_add3_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_rms_norm_scale_pipeline;
 static id<MTLComputePipelineState> g_dsv4_qkv_rms_norm_pipeline;
 static id<MTLComputePipelineState> g_hc_split_sinkhorn_pipeline;
@@ -6590,6 +6591,22 @@ int ds4_gpu_init(void) {
             return 0;
         }
 
+        fn = [library newFunctionWithName:@"kernel_add3_rms_norm_mul_f32_4"];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_add3_rms_norm_mul_f32_4 function not found\n");
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_add3_rms_norm_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_add3_rms_norm_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_add3_rms_norm_mul_f32_4 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
         fn = [library newFunctionWithName:@"kernel_dsv4_qkv_rms_norm_f32_4"];
         if (!fn) {
             fprintf(stderr, "ds4: Metal kernel_dsv4_qkv_rms_norm_f32_4 function not found\n");
@@ -9309,6 +9326,7 @@ void ds4_gpu_cleanup(void) {
         g_rms_norm_pipeline = nil;
         g_rms_norm_plain_pipeline = nil;
         g_add_rms_norm_pipeline = nil;
+        g_add3_rms_norm_pipeline = nil;
         g_rms_norm_scale_pipeline = nil;
         g_dsv4_qkv_rms_norm_pipeline = nil;
         g_hc_split_sinkhorn_pipeline = nil;
@@ -19085,6 +19103,74 @@ int ds4_gpu_rms_norm_weight_rows_tensor(
         ds4_gpu_end_compute_encoder(cb, enc);
 
         if (!ds4_gpu_finish_command_buffer(cb, owned, "weighted RMS norm")) return 0;
+    }
+
+    return 1;
+}
+
+int ds4_gpu_add3_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *c,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps) {
+    if (!g_initialized && !ds4_gpu_init()) return 0;
+    if (!norm_out || !sum_out || !a || !b || !c || n == 0 || (n & 3u) != 0) return 0;
+
+    @autoreleasepool {
+        id<MTLBuffer> abuf = ds4_gpu_tensor_buffer(a);
+        id<MTLBuffer> bbuf = ds4_gpu_tensor_buffer(b);
+        id<MTLBuffer> cbuf = ds4_gpu_tensor_buffer(c);
+        id<MTLBuffer> sumbuf = ds4_gpu_tensor_buffer(sum_out);
+        id<MTLBuffer> normbuf = ds4_gpu_tensor_buffer(norm_out);
+        const uint64_t row_bytes = (uint64_t)n * sizeof(float);
+        if (!abuf || !bbuf || !cbuf || !sumbuf || !normbuf ||
+            ds4_gpu_tensor_bytes(a) < row_bytes ||
+            ds4_gpu_tensor_bytes(b) < row_bytes ||
+            ds4_gpu_tensor_bytes(c) < row_bytes ||
+            ds4_gpu_tensor_bytes(sum_out) < row_bytes ||
+            ds4_gpu_tensor_bytes(norm_out) < row_bytes) {
+            fprintf(stderr, "ds4: Metal add3+RMS norm received undersized activation buffers\n");
+            return 0;
+        }
+        if (weight_offset > model_size || row_bytes > model_size - weight_offset) {
+            fprintf(stderr, "ds4: Metal add3+RMS norm range is outside the mapped model\n");
+            return 0;
+        }
+
+        uint64_t inner_offset = 0;
+        id<MTLBuffer> wbuf = ds4_gpu_wrap_model_range(model_map,
+                                                      model_size,
+                                                      weight_offset,
+                                                      row_bytes,
+                                                      &inner_offset);
+        if (!wbuf) return 0;
+
+        ds4_gpu_rms_norm_args args = ds4_gpu_make_rms_norm_args(n, 1, eps);
+        int owned = 0;
+        id<MTLCommandBuffer> cb = ds4_gpu_command_buffer(&owned);
+        if (!cb) return 0;
+
+        id<MTLComputeCommandEncoder> enc = ds4_gpu_compute_encoder(cb);
+        [enc setComputePipelineState:g_add3_rms_norm_pipeline];
+        [enc setBytes:&args length:sizeof(args) atIndex:0];
+        [enc setBuffer:abuf offset:ds4_gpu_tensor_offset(a) atIndex:1];
+        [enc setBuffer:bbuf offset:ds4_gpu_tensor_offset(b) atIndex:2];
+        [enc setBuffer:cbuf offset:ds4_gpu_tensor_offset(c) atIndex:3];
+        [enc setBuffer:wbuf offset:(NSUInteger)inner_offset atIndex:4];
+        [enc setBuffer:sumbuf offset:ds4_gpu_tensor_offset(sum_out) atIndex:5];
+        [enc setBuffer:normbuf offset:ds4_gpu_tensor_offset(norm_out) atIndex:6];
+        [enc setThreadgroupMemoryLength:32u * sizeof(float) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(ds4_gpu_rms_norm_threads(n), 1, 1)];
+        ds4_gpu_end_compute_encoder(cb, enc);
+
+        if (!ds4_gpu_finish_command_buffer(cb, owned, "add3+RMS norm")) return 0;
     }
 
     return 1;

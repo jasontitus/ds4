@@ -874,6 +874,20 @@ int ds4_gpu_add_rms_norm_weight_tensor(
         uint32_t                n,
         float                   eps);
 
+/* Three-input sibling for the Laguna layer tail (residual + routed + shared).
+ * Metal-only today; the Laguna graph guards its use with __APPLE__. */
+int ds4_gpu_add3_rms_norm_weight_tensor(
+        ds4_gpu_tensor       *norm_out,
+        ds4_gpu_tensor       *sum_out,
+        const ds4_gpu_tensor *a,
+        const ds4_gpu_tensor *b,
+        const ds4_gpu_tensor *c,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint32_t                n,
+        float                   eps);
+
 int ds4_gpu_dsv4_qkv_rms_norm_rows_tensor(
         ds4_gpu_tensor       *q_out,
         const ds4_gpu_tensor *q,

@@ -49087,6 +49087,13 @@ static bool laguna_graph_forward_token(
                                               DS4_N_EMBD) != 0;
     }
 
+    /* On Apple each layer tail folds its residual sum into the next
+     * consumer's RMSNorm (the following layer's attn_norm, or output_norm
+     * after the last layer), so the head norm below is skipped whenever the
+     * previous tail already produced it. */
+    bool attn_norm_ready = false;
+    bool output_norm_ready = false;
+
     for (uint32_t il = 0; ok && il < DS4_N_LAYER; il++) {
         const ds4_layer_weights *l = &weights->layer[il];
         const uint32_t n_head = ds4_layer_head_count(il);
@@ -49109,13 +49116,17 @@ static bool laguna_graph_forward_token(
 
         ok = laguna_graph_capture_feature(capture, g->cur, il);
         if (!ok) break;
-        ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
-                                             g->cur,
-                                             model->map,
-                                             model->size,
-                                             l->attn_norm->abs_offset,
-                                             DS4_N_EMBD,
-                                             DS4_RMS_EPS) != 0;
+        if (attn_norm_ready) {
+            attn_norm_ready = false;
+        } else {
+            ok = ds4_gpu_rms_norm_weight_tensor(g->attn_norm,
+                                                 g->cur,
+                                                 model->map,
+                                                 model->size,
+                                                 l->attn_norm->abs_offset,
+                                                 DS4_N_EMBD,
+                                                 DS4_RMS_EPS) != 0;
+        }
         if (ok) {
             if (l->attn_q->type == DS4_TENSOR_F16) {
                 ok = ds4_gpu_laguna_qkvg_f16_tensor(
@@ -49289,10 +49300,27 @@ static bool laguna_graph_forward_token(
                                          1);
             }
             if (ok) {
-                ok = ds4_gpu_add_tensor(g->next,
-                                        g->after_attn,
-                                        g->ffn_out,
-                                        DS4_N_EMBD) != 0;
+#ifdef __APPLE__
+                if (il + 1u < DS4_N_LAYER) {
+                    ok = ds4_gpu_add_rms_norm_weight_tensor(
+                            g->attn_norm,
+                            g->next,
+                            g->after_attn,
+                            g->ffn_out,
+                            model->map,
+                            model->size,
+                            weights->layer[il + 1u].attn_norm->abs_offset,
+                            DS4_N_EMBD,
+                            DS4_RMS_EPS) != 0;
+                    attn_norm_ready = ok;
+                } else
+#endif
+                {
+                    ok = ds4_gpu_add_tensor(g->next,
+                                            g->after_attn,
+                                            g->ffn_out,
+                                            DS4_N_EMBD) != 0;
+                }
             }
         } else if (ok) {
             ok = ds4_gpu_matmul_f32_tensor(g->router_logits,
@@ -49438,11 +49466,42 @@ static bool laguna_graph_forward_token(
                 }
             }
             if (ok) {
-                ok = ds4_gpu_add3_tensor(g->next,
-                                         g->after_attn,
-                                         g->ffn_out,
-                                         g->shared_out,
-                                         DS4_N_EMBD) != 0;
+#ifdef __APPLE__
+                if (il + 1u < DS4_N_LAYER) {
+                    ok = ds4_gpu_add3_rms_norm_weight_tensor(
+                            g->attn_norm,
+                            g->next,
+                            g->after_attn,
+                            g->ffn_out,
+                            g->shared_out,
+                            model->map,
+                            model->size,
+                            weights->layer[il + 1u].attn_norm->abs_offset,
+                            DS4_N_EMBD,
+                            DS4_RMS_EPS) != 0;
+                    attn_norm_ready = ok;
+                } else if (logits_out) {
+                    ok = ds4_gpu_add3_rms_norm_weight_tensor(
+                            g->output_norm,
+                            g->next,
+                            g->after_attn,
+                            g->ffn_out,
+                            g->shared_out,
+                            model->map,
+                            model->size,
+                            weights->output_norm->abs_offset,
+                            DS4_N_EMBD,
+                            DS4_RMS_EPS) != 0;
+                    output_norm_ready = ok;
+                } else
+#endif
+                {
+                    ok = ds4_gpu_add3_tensor(g->next,
+                                             g->after_attn,
+                                             g->ffn_out,
+                                             g->shared_out,
+                                             DS4_N_EMBD) != 0;
+                }
             }
         }
 
@@ -49462,13 +49521,15 @@ static bool laguna_graph_forward_token(
         ok = laguna_graph_capture_feature(capture, g->cur, DS4_N_LAYER);
     }
     if (ok && logits_out) {
-        ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
-                                             g->cur,
-                                             model->map,
-                                             model->size,
-                                             weights->output_norm->abs_offset,
-                                             DS4_N_EMBD,
-                                             DS4_RMS_EPS) != 0;
+        if (!output_norm_ready) {
+            ok = ds4_gpu_rms_norm_weight_tensor(g->output_norm,
+                                                 g->cur,
+                                                 model->map,
+                                                 model->size,
+                                                 weights->output_norm->abs_offset,
+                                                 DS4_N_EMBD,
+                                                 DS4_RMS_EPS) != 0;
+        }
         if (ok) {
             ok = laguna_graph_matmul(g->logits,
                                      model,
