@@ -590,7 +590,9 @@ static agent_config parse_options(int argc, char **argv) {
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
             .repeat_penalty = 1.0f,   /* disabled unless asked for */
-            .repeat_last_n = 256,
+            .repeat_last_n = 64,      /* llama.cpp default; larger windows
+                                       * starve prose of common words and
+                                       * degenerate into synonym cascades */
             .think_mode = DS4_THINK_HIGH,
         },
     };
