@@ -63439,7 +63439,14 @@ static const float *ds4_session_penalized_logits(ds4_session *s);
 static void ds4_session_note_token(ds4_session *s, int token);
 
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
-    const float *logits = ds4_session_penalized_logits(s);
+    /* Greedy calls are exempt from the penalty: the agent forces greedy while
+     * emitting tool-call structure, where tags legitimately repeat, and a
+     * penalised argmax there can corrupt the tag grammar.  The sampled token
+     * is still recorded below so the window stays honest for the surrounding
+     * non-greedy text. */
+    const float *logits = temperature > 0.0f
+                        ? ds4_session_penalized_logits(s)
+                        : s->logits;
     if (!s->engine->dflash_ready || !s->speculative_enabled) {
         const int tok = sample_top_p_min_p(logits, DS4_N_VOCAB, temperature,
                                            top_k, top_p, min_p, rng,
@@ -64492,7 +64499,12 @@ static const float *ds4_session_penalized_logits(ds4_session *s) {
         while (idx < 0) idx += s->repeat_ring_cap;
         const int32_t tok = s->repeat_ring[idx];
         if (tok < 0 || (uint32_t)tok >= (uint32_t)DS4_N_VOCAB) continue;
-        float v = s->penalty_logits[tok];
+        const float v = s->penalty_logits[tok];
+        /* Once per unique token: a token appearing k times must not be
+         * penalised k-fold (1.15^20 would erase newlines from code output).
+         * An already-modified logit differs from the original, which is the
+         * dedup marker; v == 0 re-applies harmlessly. */
+        if (v != s->logits[tok]) continue;
         s->penalty_logits[tok] = v > 0.0f ? v / s->repeat_penalty
                                           : v * s->repeat_penalty;
     }
