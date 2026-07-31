@@ -8712,10 +8712,15 @@ template [[host_name("kernel_mul_mm_q6_K_f32")]] kernel mul_mm_t kernel_mul_mm<h
 
 /* Metal-4 tensor-API (MPP direct-RHS) variants of the q6_K dense GEMM, the
  * same fast path the q8_0/q4_K prefill uses: dequantize 64x32 weight tiles
- * to half in threadgroup memory, direct-RHS MPP for the activation tile. */
+ * to half in threadgroup memory, direct-RHS MPP for the activation tile.
+ * The mul_mm_mpp_direct_rhs_t typedef only exists inside dense.metal's
+ * DS4_METAL_HAS_TENSOR section, so these instantiations must carry the
+ * same guard or the library fails to compile on pre-tensor GPUs (M1). */
+#ifdef DS4_METAL_HAS_TENSOR
 template [[host_name("kernel_mul_mm_q6_K_f32_nax_direct_rhs")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<32, half, half4x4, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q6_K_f32_nax_direct_rhs_n64")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<64, half, half4x4, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
 template [[host_name("kernel_mul_mm_q6_K_f32_nax_direct_rhs_n128")]] kernel mul_mm_mpp_direct_rhs_t kernel_mul_mm_mpp_direct_rhs<128, half, half4x4, block_q6_K, QK_NL, dequantize_q6_K, float, float4x4, float>;
+#endif /* DS4_METAL_HAS_TENSOR */
 
 template [[host_name("kernel_mul_mm_id_addr_q2_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q2_K, QK_NL, dequantize_q2_K, float, float4x4, float, float2x4>;
 template [[host_name("kernel_mul_mm_id_addr_q4_K_f32")]]    kernel mul_mm_id_addr kernel_mul_mm_id_addr<32, half, half4x4, simdgroup_half8x8, half, half2x4, simdgroup_half8x8, block_q4_K, QK_NL, dequantize_q4_K, float, float4x4, float, float2x4>;
