@@ -63,6 +63,8 @@ typedef struct {
     bool top_k_set;
     bool top_p_set;
     bool min_p_set;
+    float repeat_penalty;
+    int repeat_last_n;
     uint64_t seed;
     ds4_think_mode think_mode;
 } agent_generation_options;
@@ -587,6 +589,8 @@ static agent_config parse_options(int argc, char **argv) {
             .temperature = DS4_DEFAULT_TEMPERATURE,
             .top_p = DS4_DEFAULT_TOP_P,
             .min_p = DS4_DEFAULT_MIN_P,
+            .repeat_penalty = 1.0f,   /* disabled unless asked for */
+            .repeat_last_n = 256,
             .think_mode = DS4_THINK_HIGH,
         },
     };
@@ -676,6 +680,12 @@ static agent_config parse_options(int argc, char **argv) {
         } else if (!strcmp(arg, "--min-p")) {
             c.gen.min_p = parse_float_range(need_arg(&i, argc, argv, arg), arg, 0.0f, 1.0f);
             c.gen.min_p_set = true;
+        } else if (!strcmp(arg, "--repeat-penalty")) {
+            c.gen.repeat_penalty =
+                parse_float_range(need_arg(&i, argc, argv, arg), arg, 1.0f, 2.0f);
+        } else if (!strcmp(arg, "--repeat-last-n")) {
+            c.gen.repeat_last_n =
+                parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--seed")) {
             c.gen.seed = parse_u64(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--think")) {
@@ -10695,6 +10705,13 @@ static int agent_worker_init(agent_worker *w, ds4_engine *engine, agent_config *
         w->session,
         cfg->gen.temperature <= 0.0f &&
         getenv("DS4_MTP_SPEC_DISABLE") == NULL);
+    ds4_session_set_repeat_penalty(w->session,
+                                   cfg->gen.repeat_penalty,
+                                   cfg->gen.repeat_last_n);
+    if (cfg->gen.repeat_penalty > 1.0f) {
+        fprintf(stderr, "ds4-agent: repetition penalty %.3f over last %d tokens\n",
+                (double)cfg->gen.repeat_penalty, cfg->gen.repeat_last_n);
+    }
     w->cache_dir = agent_default_cache_dir();
     if (!agent_mkdir_p(w->cache_dir)) {
         fprintf(stderr, "ds4-agent: failed to create %s: %s\n",

@@ -51352,6 +51352,15 @@ typedef struct ds4_dspark_spec_stats {
 struct ds4_session {
     ds4_engine *engine;
     bool speculative_enabled;
+    /* Repetition penalty over a sliding window of recently evaluated tokens.
+     * penalty <= 1.0 disables it and costs nothing. */
+    float    repeat_penalty;
+    int      repeat_last_n;
+    int32_t *repeat_ring;
+    int      repeat_ring_cap;
+    int      repeat_ring_len;
+    int      repeat_ring_pos;
+    float   *penalty_logits;
     ds4_dist_session *distributed;
     uint64_t tp_session_id;
 #ifndef DS4_NO_GPU
@@ -61226,6 +61235,12 @@ int ds4_session_create(ds4_session **out, ds4_engine *e, int ctx_size) {
 }
 
 void ds4_session_free(ds4_session *s) {
+    if (s) {
+        free(s->repeat_ring);
+        s->repeat_ring = NULL;
+        free(s->penalty_logits);
+        s->penalty_logits = NULL;
+    }
     if (!s) return;
     if (ds4_session_tp_leader(s) && s->tp_session_id != 0 &&
         !ds4_tp_failed(s->engine->tp.ctx)) {
@@ -63420,15 +63435,23 @@ int ds4_sample_logits(const float *logits, int n_vocab, float temperature,
     return token;
 }
 
+static const float *ds4_session_penalized_logits(ds4_session *s);
+static void ds4_session_note_token(ds4_session *s, int token);
+
 int ds4_session_sample(ds4_session *s, float temperature, int top_k, float top_p, float min_p, uint64_t *rng) {
+    const float *logits = ds4_session_penalized_logits(s);
     if (!s->engine->dflash_ready || !s->speculative_enabled) {
-        return sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
-                                  top_p, min_p, rng, s->sample_probs);
+        const int tok = sample_top_p_min_p(logits, DS4_N_VOCAB, temperature,
+                                           top_k, top_p, min_p, rng,
+                                           s->sample_probs);
+        ds4_session_note_token(s, tok);
+        return tok;
     }
     const double t0 = now_sec();
     const int token =
-        sample_top_p_min_p(s->logits, DS4_N_VOCAB, temperature, top_k,
+        sample_top_p_min_p(logits, DS4_N_VOCAB, temperature, top_k,
                            top_p, min_p, rng, s->sample_probs);
+    ds4_session_note_token(s, token);
     s->last_sample_ms = (now_sec() - t0) * 1000.0;
     return token;
 }
@@ -64415,6 +64438,65 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
         }
     }
     return rc;
+}
+
+/* Record a token in the repetition-penalty window.  Only *generated* tokens go
+ * in: an agent's prompt ends with the material it must quote back (file paths,
+ * identifiers), and penalising those makes it unable to name the very things it
+ * was asked to act on.  llama.cpp counts prompt tokens here; for tool-driven
+ * work that is actively harmful, so the window is generation-only. */
+static void ds4_session_note_token(ds4_session *s, int token) {
+    if (!s || !s->repeat_ring || s->repeat_ring_cap <= 0) return;
+    if (token < 0) return;
+    s->repeat_ring[s->repeat_ring_pos] = (int32_t)token;
+    s->repeat_ring_pos = (s->repeat_ring_pos + 1) % s->repeat_ring_cap;
+    if (s->repeat_ring_len < s->repeat_ring_cap) s->repeat_ring_len++;
+}
+
+void ds4_session_set_repeat_penalty(ds4_session *s, float penalty, int last_n) {
+    if (!s) return;
+    if (!(penalty > 1.0f) || last_n <= 0) {   /* also catches NaN */
+        s->repeat_penalty = 1.0f;
+        s->repeat_last_n = 0;
+        return;
+    }
+    if (last_n > 4096) last_n = 4096;
+    if (last_n > s->repeat_ring_cap) {
+        int32_t *ring = xmalloc((size_t)last_n * sizeof(ring[0]));
+        free(s->repeat_ring);
+        s->repeat_ring = ring;
+        s->repeat_ring_cap = last_n;
+        s->repeat_ring_len = 0;
+        s->repeat_ring_pos = 0;
+    }
+    s->repeat_penalty = penalty;
+    s->repeat_last_n = last_n;
+}
+
+/* Apply the penalty to a private copy of the logits, llama.cpp semantics:
+ * positive logits are divided, negative logits multiplied, so a repeated
+ * token always moves toward less likely regardless of sign. */
+static const float *ds4_session_penalized_logits(ds4_session *s) {
+    if (!s || !(s->repeat_penalty > 1.0f) || s->repeat_ring_len <= 0) {
+        return s ? s->logits : NULL;
+    }
+    if (!s->penalty_logits) {
+        s->penalty_logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(s->penalty_logits[0]));
+    }
+    memcpy(s->penalty_logits, s->logits, (size_t)DS4_N_VOCAB * sizeof(s->logits[0]));
+    const int window = s->repeat_ring_len < s->repeat_last_n
+                     ? s->repeat_ring_len : s->repeat_last_n;
+    for (int i = 0; i < window; i++) {
+        /* walk backwards from the most recently written slot */
+        int idx = s->repeat_ring_pos - 1 - i;
+        while (idx < 0) idx += s->repeat_ring_cap;
+        const int32_t tok = s->repeat_ring[idx];
+        if (tok < 0 || (uint32_t)tok >= (uint32_t)DS4_N_VOCAB) continue;
+        float v = s->penalty_logits[tok];
+        s->penalty_logits[tok] = v > 0.0f ? v / s->repeat_penalty
+                                          : v * s->repeat_penalty;
+    }
+    return s->penalty_logits;
 }
 
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {

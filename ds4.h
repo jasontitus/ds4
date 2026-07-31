@@ -350,6 +350,11 @@ void ds4_session_set_cancel(ds4_session *s, ds4_session_cancel_fn fn, void *ud);
  * sequence. Frontends disable it for sampling modes that cannot use a greedy
  * verifier, avoiding support-model work on every ordinary decode token. */
 void ds4_session_set_speculative_enabled(ds4_session *s, bool enabled);
+/* Repetition penalty over the last `last_n` evaluated tokens.  `penalty` <= 1.0
+ * (or last_n <= 0) disables it, which is the default.  Positive logits are
+ * divided by the penalty and negative logits multiplied, matching llama.cpp,
+ * so a repeated token always moves toward less likely. */
+void ds4_session_set_repeat_penalty(ds4_session *s, float penalty, int last_n);
 void ds4_session_report_progress(ds4_session *s, const char *event, int current, int total);
 /* Distributed coordinator sessions return 1 when the full layer route is
  * available, 0 when it is still incomplete, and -1 for a local API error. */
