@@ -4782,6 +4782,16 @@ static bool agent_worker_reset_to_sysprompt(agent_worker *w, char *err, size_t e
 
     agent_worker_note_system_prompt_seen(w);
     pthread_mutex_lock(&w->mu);
+    /* Non-interactive runs have no TUI footer, so the per-turn throughput
+     * is otherwise invisible in logs; emit it before the reset below. */
+    if (w->cfg->non_interactive &&
+        (w->status.prefill_total > 0 || w->status.generated > 0)) {
+        fprintf(stderr,
+                "ds4-agent: turn stats: prefill %d tok @ %.1f t/s, "
+                "generated %d tok @ %.1f t/s\n",
+                w->status.prefill_total, w->status.prefill_tps,
+                w->status.generated, w->status.gen_tps);
+    }
     w->user_activity = false;
     w->session_dirty = false;
     w->status.state = AGENT_WORKER_IDLE;
