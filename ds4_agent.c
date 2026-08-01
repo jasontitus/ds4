@@ -10938,6 +10938,11 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
+    /* Track peak turn throughput from status snapshots; the worker zeroes
+     * its counters on the idle transition before the main loop can see
+     * them, so remember the last live values for the exit stats line. */
+    int stats_prefill_total = 0, stats_generated = 0;
+    double stats_prefill_tps = 0.0, stats_gen_tps = 0.0;
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -11051,6 +11056,14 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             waiting_announced = false;
         }
 
+        if (st.prefill_total > stats_prefill_total) {
+            stats_prefill_total = st.prefill_total;
+            stats_prefill_tps = st.prefill_tps;
+        }
+        if (st.generated > stats_generated) {
+            stats_generated = st.generated;
+            if (st.gen_tps > 0.0) stats_gen_tps = st.gen_tps;
+        }
         if (one_shot && one_shot_submitted && worker_is_idle(&worker)) break;
         if (!one_shot && stdin_eof && input.len == 0 &&
             queue.len == 0 && worker_is_idle(&worker))
@@ -11067,6 +11080,14 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
         fflush(stdout);
     }
     free(out);
+
+    if (stats_prefill_total > 0 || stats_generated > 0) {
+        fprintf(stderr,
+                "ds4-agent: turn stats: prefill %d tok @ %.1f t/s, "
+                "generated %d tok @ %.1f t/s\n",
+                stats_prefill_total, stats_prefill_tps,
+                stats_generated, stats_gen_tps);
+    }
 
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
     agent_input_buf_free(&input);
