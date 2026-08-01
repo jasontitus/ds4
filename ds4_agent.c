@@ -11056,10 +11056,10 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             waiting_announced = false;
         }
 
-        if (st.prefill_total > stats_prefill_total) {
+        if (st.prefill_total > stats_prefill_total)
             stats_prefill_total = st.prefill_total;
+        if (st.prefill_tps > stats_prefill_tps)
             stats_prefill_tps = st.prefill_tps;
-        }
         if (st.generated > stats_generated) {
             stats_generated = st.generated;
             if (st.gen_tps > 0.0) stats_gen_tps = st.gen_tps;
