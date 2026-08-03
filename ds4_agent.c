@@ -10938,11 +10938,16 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     agent_prompt_queue queue = {0};
     double quiet_deadline = 0.0;
     int rc = 0;
-    /* Track peak turn throughput from status snapshots; the worker zeroes
-     * its counters on the idle transition before the main loop can see
-     * them, so remember the last live values for the exit stats line. */
+    /* Track throughput from status snapshots; the worker zeroes its
+     * counters on the idle transition before the main loop can see them,
+     * so remember the last live values per turn — and ACCUMULATE across
+     * turns: the exit line must report session totals with token-weighted
+     * rates, not just the final turn (a multi-turn session previously
+     * reported ~13k generated when it produced ~150k). */
     int stats_prefill_total = 0, stats_generated = 0;
     double stats_prefill_tps = 0.0, stats_gen_tps = 0.0;
+    long tot_prefill = 0, tot_generated = 0;
+    double pre_time_s = 0.0, gen_time_s = 0.0;
 
     if (!one_shot) {
         if (set_nonblock(STDIN_FILENO, true, &old_stdin_flags) != 0) {
@@ -11056,6 +11061,20 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
             waiting_announced = false;
         }
 
+        /* A drop in either counter marks a turn boundary (the worker reset
+         * for the next turn): bank the finished turn into the session
+         * totals before tracking the new one. */
+        if (st.prefill_total < stats_prefill_total ||
+            st.generated < stats_generated) {
+            tot_prefill += stats_prefill_total;
+            if (stats_prefill_tps > 0.0)
+                pre_time_s += stats_prefill_total / stats_prefill_tps;
+            tot_generated += stats_generated;
+            if (stats_gen_tps > 0.0)
+                gen_time_s += stats_generated / stats_gen_tps;
+            stats_prefill_total = 0; stats_prefill_tps = 0.0;
+            stats_generated = 0;     stats_gen_tps = 0.0;
+        }
         if (st.prefill_total > stats_prefill_total)
             stats_prefill_total = st.prefill_total;
         if (st.prefill_tps > stats_prefill_tps)
@@ -11081,12 +11100,22 @@ static int run_agent_non_interactive(ds4_engine *engine, agent_config *cfg) {
     }
     free(out);
 
-    if (stats_prefill_total > 0 || stats_generated > 0) {
+    /* Fold the in-flight turn, then report SESSION totals in the same
+     * line format (ds4-box parses it token-weighted downstream). */
+    tot_prefill += stats_prefill_total;
+    if (stats_prefill_tps > 0.0)
+        pre_time_s += stats_prefill_total / stats_prefill_tps;
+    tot_generated += stats_generated;
+    if (stats_gen_tps > 0.0)
+        gen_time_s += stats_generated / stats_gen_tps;
+    if (tot_prefill > 0 || tot_generated > 0) {
         fprintf(stderr,
-                "ds4-agent: turn stats: prefill %d tok @ %.1f t/s, "
-                "generated %d tok @ %.1f t/s\n",
-                stats_prefill_total, stats_prefill_tps,
-                stats_generated, stats_gen_tps);
+                "ds4-agent: turn stats: prefill %ld tok @ %.1f t/s, "
+                "generated %ld tok @ %.1f t/s\n",
+                tot_prefill,
+                pre_time_s > 0.0 ? (double)tot_prefill / pre_time_s : 0.0,
+                tot_generated,
+                gen_time_s > 0.0 ? (double)tot_generated / gen_time_s : 0.0);
     }
 
     if (stdin_nonblock) fcntl(STDIN_FILENO, F_SETFL, old_stdin_flags);
